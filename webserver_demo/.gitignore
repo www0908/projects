@@ -1,0 +1,10 @@
+# 过滤掉所有编译出的二进制文件和可执行程序
+server
+my_server2
+test_file
+test_pool
+a.out
+*.o
+
+# 过滤掉 VS Code 自动生成的配置文件夹
+.vscode/
