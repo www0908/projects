@@ -113,15 +113,10 @@ if(!file.is_open()){
     return"";
 
 }
-std::string content;
-std::string line;
-while(std::getline(file,line)){
-    content +=line +"\n";
-
+std::ostringstream buffer;
+buffer<<file.rdbuf();
+return buffer.str();
 }
-file.close();
-return content;
-};
 int main(){
     ThreadPool pool(4);
     std::unordered_map<int,HttpConnection> connection; // 用于存储每个客户端的解析器实例
