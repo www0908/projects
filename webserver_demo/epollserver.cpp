@@ -12,6 +12,7 @@
 #include<fstream>
 #include<cerrno>
 #include<mutex>
+#include<string_view>
 #include "Threadpool.h"
 #define PORT 8080
 const int MAX_EVENTS = 1024; // 最大事件数
@@ -62,26 +63,17 @@ struct HttpConnection {
     std::string full_data;   // 用于存储完整的HTTP请求数据
 };
 std::string parse_http_request(const char* buffer,ssize_t bytes_recevied){
-    std::string raw_request(buffer, bytes_recevied);// 将接收到的缓冲区数据转换为字符串
-    size_t line_end = raw_request.find("\r\n"); // 查找请求行结束
-    if(line_end == std::string::npos){
-        line_end = raw_request.find('\n');
-        if(line_end == std::string::npos){
-            std::cerr<<"无效的HTTP请求\n"<<std::endl;
+    std::string_view raw_request(buffer,bytes_recevied);
+    size_t line_end =raw_request.find("\r\n");
+    if(line_end==std::string_view::npos){
+        line_end=raw_request.find('n');
+        if(line_end==std::string_view::npos){
             return "";
         }
-    }
-    std::string request_line =raw_request.substr(0,line_end);// 提取请求行
-    std::istringstream request_stream(request_line);// 使用字符串流解析 请求行
-    std::string method, path, version;// 定义变量存储请求方法、路径
-    if(request_stream>>method>>path>>version){
-        std::cout<<"请求方法: "<<method<<std::endl;
-        std::cout<<"请求路径: "<<path<<std::endl;
-        return path; // 返回请求路径
-    }
-    std::cerr<<"无法解析HTTP请求行\n"<<std::endl;
-    return "";
 
+    }
+    std::string_view first_line=raw_request.substr(0,line_end);
+    return std::string(first_line);
 
 
 }
