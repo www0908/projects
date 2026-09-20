@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -pthread -Wl,--dependency-file=CMakeFiles/test_buffer.dir/link.d CMakeFiles/test_buffer.dir/test_buffer.cpp.o CMakeFiles/test_buffer.dir/buffer.cpp.o -o test_buffer

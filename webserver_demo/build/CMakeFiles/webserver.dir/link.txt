@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -pthread -Wl,--dependency-file=CMakeFiles/webserver.dir/link.d CMakeFiles/webserver.dir/epollserver.cpp.o CMakeFiles/webserver.dir/sqlConnPool.cpp.o CMakeFiles/webserver.dir/buffer.cpp.o -o webserver  -lmysqlclient -lcrypto -lssl
