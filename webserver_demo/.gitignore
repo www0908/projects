@@ -8,3 +8,14 @@ a.out
 
 # 过滤掉 VS Code 自动生成的配置文件夹
 .vscode/
+# 忽略所有 cmake 自动生成的目录和文件
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# 忽略编译出来的中间文件和可执行文件
+*.o
+*.d
+*.out
+webserver # 假设这是你最后生成的可执行文件名
