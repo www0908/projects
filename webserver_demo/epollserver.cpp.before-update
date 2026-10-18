@@ -1,0 +1,537 @@
+#include <iostream>
+#include <cstring>
+#include <unistd.h> 
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/epoll.h>
+#include <string>
+#include <fcntl.h>
+#include <sstream>
+#include <unordered_map>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fstream>
+#include <cerrno>
+#include <mutex>
+#include <string_view>
+#include "Threadpool.h"
+#include <queue>
+#include <chrono>
+#include <algorithm>
+#include "buffer.h"
+#include "AsyncLogger.h"
+#include "sqlConnPool.h"
+#include "crypto_util.h"
+#include <sys/uio.h> // writev 需要用到
+
+#define PORT 8080
+
+std::unordered_map<std::string,std::string> ParsePostFormData(const std::string& body){
+    std::unordered_map<std::string,std::string> post_data;
+    size_t start=0;
+    size_t end=0;
+    while((end=body.find('&',start))!=std::string::npos){
+        std::string pair=body.substr(start,end-start);
+        size_t equal_pos=pair.find('=');
+        if(equal_pos!=std::string::npos){
+            std::string key=pair.substr(0,equal_pos);
+            std::string value=pair.substr(equal_pos+1);
+            post_data[key]=value;
+        }
+        start=end+1;
+    }
+  std::string last_pair=body.substr(start);
+  size_t equal_pos=last_pair.find('=');
+    if(equal_pos!=std::string::npos){
+        std::string key=last_pair.substr(0,equal_pos);
+        std::string value=last_pair.substr(equal_pos+1);
+        post_data[key]=value;
+    }
+    return post_data;
+}
+
+bool VerifyUser(const std::string& name,const std::string& pwd,bool isLogin){
+    if(name.empty()||pwd.empty()){
+        return false;
+    }
+    MYSQL* sql=nullptr;
+    SqlConnRAII raii(&sql,SqlConnPool::Instance());
+    if(!sql){
+        return false;
+    }
+    std::string pwd_hash =sha256(pwd);
+    bool flag=false;
+    MYSQL_STMT* stmt=mysql_stmt_init(sql);
+    if(!stmt) return false;
+    const char* query="SELECT password FROM users where username=? limit 1";
+    if(mysql_stmt_prepare(stmt,query,strlen(query))!=0){
+        LOG_ERROR("{DB ERROR} stmt prepare 失败：%s", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        return false;
+    }
+    MYSQL_BIND bind_param[1];
+    memset(bind_param,0,sizeof(bind_param));
+    unsigned long name_len=name.length();
+    bind_param[0].buffer_type=MYSQL_TYPE_STRING;
+    bind_param[0].buffer=const_cast<char*>(name.c_str());
+    bind_param[0].buffer_length=name_len;
+    bind_param[0].length=&name_len;
+    mysql_stmt_bind_param(stmt,bind_param);
+    
+    if (mysql_stmt_execute(stmt) == 0) {
+        mysql_stmt_store_result(stmt);
+        int rows = mysql_stmt_num_rows(stmt);
+
+        if (rows > 0) {
+            // 用户已存在
+            if (isLogin) {
+                // 登录分支：提取数据库中已存的 64 位哈希值
+                char db_pwd_hash[65] = {0};
+                unsigned long out_len = 0;
+                MYSQL_BIND bind_result[1];
+                memset(bind_result, 0, sizeof(bind_result));
+
+                bind_result[0].buffer_type = MYSQL_TYPE_STRING;
+                bind_result[0].buffer = db_pwd_hash;
+                bind_result[0].buffer_length = sizeof(db_pwd_hash);
+                bind_result[0].length = &out_len;
+
+                mysql_stmt_bind_result(stmt, bind_result);
+
+                if (mysql_stmt_fetch(stmt) == 0) {
+                    // 比对哈希串
+                    if (pwd_hash == std::string(db_pwd_hash)) {
+                        flag = true;
+                    }
+                }
+            } else {
+                // 注册分支：用户名已存在，注册失败
+                flag = false;
+            }
+        } else {
+            // 用户不存在
+            if (!isLogin) {
+                // 注册分支：执行安全插入
+                mysql_stmt_close(stmt); // 先关闭查询的 stmt
+                stmt = mysql_stmt_init(sql);
+
+                const char* insert_sql = "INSERT INTO users(username, password) VALUES(?, ?)";
+                if (mysql_stmt_prepare(stmt, insert_sql, strlen(insert_sql)) == 0) {
+                    MYSQL_BIND insert_bind[2];
+                    memset(insert_bind, 0, sizeof(insert_bind));
+
+                    // 绑定 username
+                    insert_bind[0].buffer_type = MYSQL_TYPE_STRING;
+                    insert_bind[0].buffer = const_cast<char*>(name.c_str());
+                    insert_bind[0].buffer_length = name_len;
+                    insert_bind[0].length = &name_len;
+
+                    // 绑定加盐哈希后的 password
+                    unsigned long hash_len = pwd_hash.length();
+                    insert_bind[1].buffer_type = MYSQL_TYPE_STRING;
+                    insert_bind[1].buffer = const_cast<char*>(pwd_hash.c_str());
+                    insert_bind[1].buffer_length = hash_len;
+                    insert_bind[1].length = &hash_len;
+
+                    mysql_stmt_bind_param(stmt, insert_bind);
+                    if (mysql_stmt_execute(stmt) == 0) {
+                        flag = true; // 注册落库成功
+                    }
+                }
+            }
+        }
+    }
+
+    // 释放预处理句柄
+    mysql_stmt_close(stmt);
+    return flag;
+}
+
+const int MAX_EVENTS = 1024; // 最大事件数
+const int BUFFER_SIZE = 1024;//定义缓冲区大小
+
+long long get_current_time() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+struct TimerNode{
+    int fd;
+    long long expire_time;
+    bool operator<(const TimerNode& other) const {
+        return expire_time > other.expire_time; // 过期时间越小，优先级越高
+    }
+};
+
+enum CheckState { STATE_REQUEST_LINE = 0, STATE_HEADER, STATE_BODY,STATE_FINISH };
+enum HttpCode { NO_REQUEST = 0, GET_REQUEST, BAD_REQUEST };
+
+class MmapFile{
+public:
+    char* file_ptr;
+    size_t file_size;
+    
+    MmapFile(const std::string& filepath): file_ptr(nullptr),file_size(0){
+        int fd = open(filepath.c_str(), O_RDONLY);
+        if(fd < 0) return;
+        struct stat stat_buf;
+        if(fstat(fd, &stat_buf) == 0){
+            file_size = stat_buf.st_size;
+            file_ptr = (char*)mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if(file_ptr == MAP_FAILED){
+                file_ptr = nullptr;
+                file_size = 0;
+            }
+        }
+        close(fd);
+    }
+  
+    ~MmapFile(){
+        if(file_ptr != nullptr && file_size > 0){
+            munmap(file_ptr, file_size);
+        }
+    }
+};
+
+class HttpParser{
+private:
+    CheckState current_state;
+    int content_length_;
+public:
+    std::string request_path;
+    std::string method;
+    std::string body_data;
+      
+    HttpParser(){
+        current_state = STATE_REQUEST_LINE;
+        content_length_ = 0;
+    }
+      
+    void reset(){
+        current_state = STATE_REQUEST_LINE;
+        request_path.clear();
+        method.clear();
+        body_data.clear();
+        content_length_ = 0;
+    }
+      
+    HttpCode parse(Buffer& buffer){
+        while (buffer.ReadableBytes() > 0){
+            if(current_state == STATE_BODY){
+                if(buffer.ReadableBytes() < content_length_){
+                    return NO_REQUEST;
+                }
+                body_data = buffer.RetrieveToStr(content_length_);
+                current_state = STATE_FINISH;
+                return GET_REQUEST;
+            }
+            
+            const char* crlf = std::search(buffer.Peek(), buffer.BeginWriteConst(), "\r\n", "\r\n"+2);
+            if(crlf == buffer.BeginWriteConst()){
+                return NO_REQUEST;
+            }
+            
+            std::string line(buffer.Peek(), crlf);
+            buffer.RetrieveUntil(crlf + 2);
+            
+            switch (current_state){
+                case STATE_REQUEST_LINE:{
+                    if(line.empty()) return BAD_REQUEST;
+                    std::istringstream iss(line);
+                    std::string version;
+                    iss >> this->method >> this->request_path >> version;
+                    current_state = STATE_HEADER;
+                    break;
+                }
+                case STATE_HEADER:{
+                    if(line.empty()){
+                        if(content_length_ > 0){
+                            current_state = STATE_BODY;
+                            break;
+                        }
+                        else{
+                            current_state = STATE_FINISH;
+                            return GET_REQUEST;
+                        }
+                    }
+                    if(line.find("Content-Length:") != std::string::npos){
+                        size_t pos = line.find(":");
+                        if(pos != std::string::npos){
+                            content_length_ = std::stoi(line.substr(pos+1));
+                        }
+                    }
+                    break;
+                }
+                default: 
+                    break;
+            }
+        }
+        return NO_REQUEST;
+    }
+};
+
+struct HttpConnection {
+    HttpParser parser;       // 专属的状态机
+    Buffer readBuff;      // 喂给状态机消化用的数据
+    Buffer writeBuff;
+    std::string full_data;   // 用于存储完整的HTTP请求数据
+    long long last_expire_time; // 用于存储最后过期时间
+    HttpConnection() : readBuff(1024), writeBuff(1024), last_expire_time(0) {}
+};
+
+void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);// 获取文件描述符的当前标志
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);// 设置非阻塞模式
+}
+
+int main(){
+    // 初始化数据库连接池
+    SqlConnPool::Instance()->Init("127.0.0.1", 3306, "root", "123456", "webserver_db", 10);
+    ThreadPool pool(4);
+    
+    std::unordered_map<int,std::shared_ptr<HttpConnection>> connection; // 用于存储每个客户端的解析器实例
+    std::mutex connection_mutex; // 保护 connection 的互斥锁
+    
+    std::unordered_map<std::string, std::string> router = {
+        {"/","index.html"},
+        {"/study/linux/tcp","tcp.html"},
+        {"/user","user.html"},
+        {"/error.html", "error.html"}
+    };
+    
+    std::priority_queue<TimerNode> timer_heap; // 用于存储定时器节点的优先队列
+    std::mutex timer_mutex; // 保护 timer_heap 的互斥锁
+    
+    int epoll_fd = epoll_create1(0);// 创建epoll实例
+    int server_fd = socket(AF_INET,SOCK_STREAM,0);
+    if(server_fd < 0){
+        LOG_ERROR("Socket 创建失败");
+        return -1;
+    }
+    
+    int opt = 1;//设置套接字选项
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));// 设置套接字选项，允许地址重用
+    
+    sockaddr_in address{};//定义服务器地址结构体
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;// 绑定到所有可用的网络接口
+    address.sin_port = htons(PORT);// 将端口号转换为网络字节序
+    
+    if(bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0){
+        LOG_ERROR("绑定失败");
+        return -1;
+    }
+    
+    if(listen(server_fd, 5) < 0){
+        LOG_ERROR("监听失败");
+        return -1;
+    }
+    
+    set_nonblocking(server_fd);// 设置服务器套接字为非阻塞模式
+    
+    struct epoll_event ev{};
+    ev.events = EPOLLIN; // 设置事件类型为可读事件
+    ev.data.fd = server_fd; // 将服务器套接字的文件描述符存
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev); // 将服务器套接字添加到epoll实例中
+    
+    struct epoll_event events[MAX_EVENTS]; // 用于存储就绪事件的数组
+    LOG_INFO("epoll服务器已启动，监听端口 %d", PORT);
+
+    while (true) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        if(nfds == -1 && errno != EINTR) {
+            LOG_ERROR("epoll_wait 错误");
+            break;
+        }
+        
+        {
+            long long current_time = get_current_time();
+            std::lock_guard<std::mutex> c_lock(connection_mutex);
+            std::lock_guard<std::mutex> t_lock(timer_mutex);
+            while(!timer_heap.empty()){
+                TimerNode top_timer = timer_heap.top();
+                if(top_timer.expire_time > current_time){
+                    break;
+                }
+                timer_heap.pop();
+                if(connection.find(top_timer.fd) != connection.end()){
+                    if(connection[top_timer.fd]->last_expire_time == top_timer.expire_time){
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, top_timer.fd, nullptr);
+                        close(top_timer.fd);
+                        connection.erase(top_timer.fd);
+                    }
+                }
+            }
+        }
+
+        for(int i = 0; i < nfds; i++){
+            int fd = events[i].data.fd;
+
+            if(fd == server_fd) {
+                // 【前台接待】
+                sockaddr_in client_addr{};
+                socklen_t client_addr_len = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len);
+                
+                if(client_fd < 0){
+                    continue;
+                }
+                
+                set_nonblocking(client_fd);
+                struct epoll_event ev{};
+                ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT; 
+                ev.data.fd = client_fd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+
+                long long expire = get_current_time() + 10000;
+
+                {
+                    std::lock_guard<std::mutex> c_lock(connection_mutex);
+                    connection[client_fd] = std::make_shared<HttpConnection>();
+                    connection[client_fd]->last_expire_time = expire;
+                }
+            
+                {
+                    std::lock_guard<std::mutex> t_lock(timer_mutex);
+                    timer_heap.push({client_fd, expire});
+                }
+            } 
+            else if(events[i].events & EPOLLIN) {
+                int client_fd = events[i].data.fd;
+                
+                // 【后厨处理业务】
+                pool.enqueue([client_fd, &connection, &connection_mutex, &router, &timer_heap, &timer_mutex, epoll_fd]{
+                    std::shared_ptr<HttpConnection> conn_ptr;
+                    {
+                        std::lock_guard<std::mutex> lock(connection_mutex);
+                        if(connection.find(client_fd) == connection.end()) {
+                            return;
+                        }
+                        conn_ptr = connection[client_fd];
+                    }
+                  
+                    int saveErrno = 0;
+                    ssize_t bytes_read = conn_ptr->readBuff.ReadFd(client_fd, &saveErrno);
+                
+                    if(bytes_read > 0) {
+                        // 核心状态机循环解析
+                        while (conn_ptr->parser.parse(conn_ptr->readBuff) == GET_REQUEST) {
+                            std::string path = conn_ptr->parser.request_path; 
+                            std::string method = conn_ptr->parser.method;
+                            std::string status_line, html_body;
+                            
+                            if(method == "POST"){
+                                auto post_data = ParsePostFormData(conn_ptr->parser.body_data);
+                                std::string user = post_data["username"];
+                                std::string pwd = post_data["password"];
+                                if(path == "/login"){
+                                    if(VerifyUser(user, pwd, true)){
+                                        path = "/";
+                                    } else {
+                                        path = "/error.html";
+                                    }
+                                } else if(path == "/register") {
+                                    if(VerifyUser(user, pwd, false)){
+                                        path = "/user";
+                                    } else {
+                                        path = "/error.html";
+                                    }
+                                }
+                                conn_ptr->readBuff.RetrieveAll(); // 清空缓冲区，准备接收下一次请求
+                            }
+                            
+                            if(path.empty()){
+                                status_line = "HTTP/1.1 400 Bad Request\r\n";
+                                std::string error_body = "<html><body><h1>400 Bad Request</h1><p>请求不合法</p></body></html>";
+                                std::string header = status_line + 
+                                         "Content-Type: text/html; charset=utf-8\r\n"
+                                         "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
+                                         "Connection: keep-alive\r\n\r\n" + error_body;
+                                conn_ptr->writeBuff.Append(header);
+                                int writeErrno = 0;
+                                conn_ptr->writeBuff.WriteFd(client_fd, &writeErrno);
+                            } else {
+                                auto it = router.find(path);
+                                if(it != router.end()){
+                                    std::string filepath = it->second;
+                                    MmapFile html_file(filepath);
+                                    std::string status_line;
+                                    std::string header;
+                                    
+                                    if(html_file.file_ptr == nullptr || html_file.file_size == 0){
+                                        status_line = "HTTP/1.1 404 Not Found\r\n";
+                                        std::string error_body = "<html><body><h1>404 Not Found (or mmap failed)</h1></body></html>";
+                                        header = status_line + 
+                                         "Content-Type: text/html; charset=utf-8\r\n"
+                                         "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
+                                         "Connection: keep-alive\r\n\r\n" + error_body;
+                                        conn_ptr->writeBuff.Append(header);
+                                        int writeErrno = 0;
+                                        conn_ptr->writeBuff.WriteFd(client_fd, &writeErrno);
+                                    } else {
+                                        status_line = "HTTP/1.1 200 OK\r\n";
+                                        header = status_line + 
+                                         "Content-Type: text/html; charset=utf-8\r\n"
+                                         "Content-Length: " + std::to_string(html_file.file_size) + "\r\n"
+                                         "Connection: keep-alive\r\n\r\n";
+                                        conn_ptr->writeBuff.Append(header);
+                                        struct iovec iov[2];
+                                        iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
+                                        iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
+                                        iov[1].iov_base = html_file.file_ptr;
+                                        iov[1].iov_len = html_file.file_size;
+                                        ssize_t bytes_sent = writev(client_fd, iov, 2);
+                                        if(bytes_sent > 0){
+                                            conn_ptr->writeBuff.RetrieveAll();
+                                        }
+                                    }
+                                } 
+                                // ✅ 修复黑洞：如果找不到路由，返回 404
+                                else {
+                                    status_line = "HTTP/1.1 404 Not Found\r\n";
+                                    std::string error_body = "<html><body><h1>404 Not Found</h1><p>The requested URL was not found on this server.</p></body></html>";
+                                    std::string header = status_line + 
+                                                         "Content-Type: text/html; charset=utf-8\r\n"
+                                                         "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
+                                                         "Connection: keep-alive\r\n\r\n" + error_body;
+                                    conn_ptr->writeBuff.Append(header);
+                                    int writeErrno = 0;
+                                    conn_ptr->writeBuff.WriteFd(client_fd, &writeErrno);
+                                }
+                            }
+                            
+                            // 网页发完了，重置定时器，清空读缓冲区，准备接收下一次请求
+                           // ✅ 抢救方案：重置状态机大脑，绝不能清空 readBuff（因为 readBuff 还要留着处理下个粘包请求）
+                            conn_ptr->parser.reset(); 
+                            
+                            long long new_expire = get_current_time() + 10000; 
+                            conn_ptr->last_expire_time = new_expire;
+                            {
+                                std::lock_guard<std::mutex> t_lock(timer_mutex);
+                                timer_heap.push({client_fd, new_expire});   
+                            }
+                        }
+
+                        // 重置 EPOLLET，准备接收下一次请求
+                        struct epoll_event ev{};
+                        ev.events = EPOLLIN | EPOLLONESHOT; 
+                        ev.data.fd = client_fd;
+                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev); 
+
+                    } 
+                    else if (bytes_read == 0 || (bytes_read < 0 && saveErrno != EAGAIN)) { 
+                        close(client_fd);
+                        std::lock_guard<std::mutex> lock(connection_mutex);
+                        connection.erase(client_fd);
+                    }
+                });
+            }
+        }
+    }
+    
+    close(server_fd); 
+    close(epoll_fd); 
+    return 0;
+}

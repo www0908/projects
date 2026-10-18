@@ -31,3 +31,6 @@ buffer.cpp
 target_link_libraries(test_buffer PRIVATE 
 Threads::Threads 
 )
+
+enable_testing()
+add_test(NAME buffer_tests COMMAND test_buffer)
