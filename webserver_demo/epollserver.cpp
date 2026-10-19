@@ -278,7 +278,51 @@ struct HttpConnection {
     Buffer writeBuff;
     std::string full_data;   // 用于存储完整的HTTP请求数据
     long long last_expire_time; // 用于存储最后过期时间
-    HttpConnection() : readBuff(1024), writeBuff(1024), last_expire_time(0) {}
+    struct iovec iov[2];
+    int iov_cnt;
+    size_t bytes_to_send;
+    size_t bytes_have_send;
+    char* file_ptr;
+    size_t file_size;
+    HttpConnection() : readBuff(1024), writeBuff(1024), last_expire_time(0),iov_cnt(0), bytes_to_send(0),bytes_have_send(0), file_ptr(nullptr), file_size(0) {}
+    ~HttpConnection(){
+        UnmapFile();
+    }
+    void UnmapFile(){
+        if(file_ptr!=nullptr&&file_size>0){
+            munmap(file_ptr,file_size);
+            file_ptr=nullptr;
+            file_size=0;
+        }
+    }
+    bool MapFile(const std::string& filepath){
+        UnmapFile(); // 映射新文件前，先把老文件清理了防内存泄露
+        int fd = open(filepath.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        struct stat stat_buf;
+        if (fstat(fd, &stat_buf) == 0) {
+            file_size = stat_buf.st_size;
+            file_ptr = (char*)mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (file_ptr == MAP_FAILED) {
+                file_ptr = nullptr;
+                file_size = 0;
+                close(fd);
+                return false;
+            }
+        } else {
+            close(fd);
+            return false;
+        }
+        close(fd);
+        return true;
+    }
+    void ClearResponseState() {
+        UnmapFile(); // 彻底发完一个网页后，主动释放内存
+        writeBuff.RetrieveAll();
+        iov_cnt = 0;
+        bytes_to_send = 0;
+        bytes_have_send = 0;
+    }
 };
 
 void set_nonblocking(int fd) {
@@ -439,7 +483,7 @@ int main(){
                                         path = "/error.html";
                                     }
                                 }
-                                conn_ptr->readBuff.RetrieveAll(); // 清空缓冲区，准备接收下一次请求
+                               // conn_ptr->readBuff.RetrieveAll(); // 清空缓冲区，准备接收下一次请求
                             }
                             
                             if(path.empty()){
@@ -456,35 +500,60 @@ int main(){
                                 auto it = router.find(path);
                                 if(it != router.end()){
                                     std::string filepath = it->second;
-                                    MmapFile html_file(filepath);
+                                   // MmapFile html_file(filepath);
                                     std::string status_line;
                                     std::string header;
                                     
-                                    if(html_file.file_ptr == nullptr || html_file.file_size == 0){
-                                        status_line = "HTTP/1.1 404 Not Found\r\n";
-                                        std::string error_body = "<html><body><h1>404 Not Found (or mmap failed)</h1></body></html>";
-                                        header = status_line + 
-                                         "Content-Type: text/html; charset=utf-8\r\n"
-                                         "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
-                                         "Connection: keep-alive\r\n\r\n" + error_body;
-                                        conn_ptr->writeBuff.Append(header);
-                                        int writeErrno = 0;
-                                        conn_ptr->writeBuff.WriteFd(client_fd, &writeErrno);
-                                    } else {
-                                        status_line = "HTTP/1.1 200 OK\r\n";
-                                        header = status_line + 
-                                         "Content-Type: text/html; charset=utf-8\r\n"
-                                         "Content-Length: " + std::to_string(html_file.file_size) + "\r\n"
-                                         "Connection: keep-alive\r\n\r\n";
-                                        conn_ptr->writeBuff.Append(header);
-                                        struct iovec iov[2];
-                                        iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
-                                        iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
-                                        iov[1].iov_base = html_file.file_ptr;
-                                        iov[1].iov_len = html_file.file_size;
-                                        ssize_t bytes_sent = writev(client_fd, iov, 2);
-                                        if(bytes_sent > 0){
-                                            conn_ptr->writeBuff.RetrieveAll();
+                                    if (!conn_ptr->MapFile(filepath)) {
+        // 如果文件找不到或者 mmap 失败，退回 404 逻辑
+        status_line = "HTTP/1.1 404 Not Found\r\n";
+        // ... (复制你原来的 404 HTML 生成逻辑) ...
+                                                         } else {
+        // 文件映射成功，准备发送报文
+                     status_line = "HTTP/1.1 200 OK\r\n";
+                  std::string header = status_line + 
+                 "Content-Type: text/html; charset=utf-8\r\n"
+                 "Content-Length: " + std::to_string(conn_ptr->file_size) + "\r\n"
+                 "Connection: keep-alive\r\n\r\n";
+        
+        conn_ptr->writeBuff.Append(header);
+                                        conn_ptr->iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
+                                        conn_ptr->iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
+                                        conn_ptr->iov[1].iov_base = conn_ptr->file_ptr;
+                                        conn_ptr->iov[1].iov_len = conn_ptr->file_size;
+
+                                        conn_ptr->iov_cnt = 2;
+// 极其重要：在发送前，必须初始化还需要发送的总字节数！
+                                        conn_ptr->bytes_have_send = 0;
+                                        conn_ptr->bytes_to_send = conn_ptr->writeBuff.ReadableBytes() + conn_ptr->file_size;
+                                        ssize_t bytes_sent = writev(client_fd, conn_ptr->iov, conn_ptr->iov_cnt);
+                                        if(bytes_sent < 0){
+                                            if(errno==EAGAIN){
+                                                struct epoll_event ev{};
+                                                ev.events=EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                                                ev.data.fd=client_fd;
+                                                epoll_ctl(epoll_fd,EPOLL_CTL_MOD,client_fd,&ev);
+                                                return;
+
+                                            }
+                                        }
+                                        else{
+                                            conn_ptr->bytes_have_send+=bytes_sent;
+                                            conn_ptr->bytes_to_send-=bytes_sent;
+                                            if(conn_ptr->bytes_have_send>=conn_ptr->writeBuff.ReadableBytes()){
+                                                conn_ptr->iov[0].iov_len=0;
+                                                size_t file_offset = conn_ptr->bytes_have_send-conn_ptr->writeBuff.ReadableBytes();
+                                                conn_ptr->iov[1].iov_base=conn_ptr->file_ptr+file_offset;
+                                                conn_ptr->iov[1].iov_len=conn_ptr->bytes_to_send;
+                                            }else{
+                                                conn_ptr->iov[0].iov_base = (char*)conn_ptr->writeBuff.Peek() + conn_ptr->bytes_have_send;
+                                                conn_ptr->iov[0].iov_len -= bytes_sent;
+                                            }
+                                            struct epoll_event ev{};
+                                            ev.events=EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                                            ev.data.fd =client_fd;
+                                            epoll_ctl(epoll_fd,EPOLL_CTL_MOD,client_fd,&ev);
+                                            return;
                                         }
                                     }
                                 } 
@@ -534,4 +603,3 @@ int main(){
     close(server_fd); 
     close(epoll_fd); 
     return 0;
-}
