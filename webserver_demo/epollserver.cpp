@@ -323,7 +323,66 @@ struct HttpConnection {
         bytes_to_send = 0;
         bytes_have_send = 0;
     }
-};
+    bool PrepareIovForRemaining() {
+        const size_t header_size = writeBuff.ReadableBytes();
+
+        if (bytes_have_send >= bytes_to_send) {
+            iov_cnt = 0;
+            return true;
+        }
+
+        // 响应头还没发完
+        if (bytes_have_send < header_size) {
+            iov[0].iov_base = const_cast<char*>(writeBuff.Peek()) + bytes_have_send;
+            iov[0].iov_len = header_size - bytes_have_send;
+
+            if (file_size > 0) {
+                iov[1].iov_base = file_ptr;
+                iov[1].iov_len = file_size;
+                iov_cnt = 2;
+            } else {
+                iov_cnt = 1;
+            }
+        } 
+        // 响应头已发完，纯发文件内容
+        else {
+            const size_t file_offset = bytes_have_send - header_size;
+            iov[0].iov_base = file_ptr + file_offset;
+            iov[0].iov_len = file_size - file_offset;
+            iov_cnt = 1;
+        }
+        
+
+        return true;
+    }
+    // 返回 true 表示响应已全部发送；false 表示遇到 EAGAIN，等待 EPOLLOUT
+bool FlushResponse(int client_fd, int& saved_errno) {
+    while (bytes_have_send < bytes_to_send) {
+        PrepareIovForRemaining();
+
+        ssize_t n = writev(client_fd, iov, iov_cnt);
+        if (n > 0) {
+            bytes_have_send += static_cast<size_t>(n);
+            continue;
+        }
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            saved_errno = errno;
+            return false;
+        }
+
+        saved_errno = (n == 0) ? EPIPE : errno;
+        return false;
+    }
+
+    return true;
+}
+}; // 结构体结束
+
 
 void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);// 获取文件描述符的当前标志
@@ -442,164 +501,208 @@ int main(){
                     timer_heap.push({client_fd, expire});
                 }
             } 
-            else if(events[i].events & EPOLLIN) {
-                int client_fd = events[i].data.fd;
+           // ✅ 修复了极其致命的优先级括号问题
+            else if (events[i].events & (EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                const int client_fd = events[i].data.fd;
+                const uint32_t ready_events = events[i].events;
                 
                 // 【后厨处理业务】
-                pool.enqueue([client_fd, &connection, &connection_mutex, &router, &timer_heap, &timer_mutex, epoll_fd]{
+                pool.enqueue([client_fd, ready_events, &connection, &connection_mutex, &router, &timer_heap, &timer_mutex, epoll_fd]{
+                    
+                    // 【第一道防线：异常拦截】
+                    if (ready_events & (EPOLLERR | EPOLLHUP)) {
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                        close(client_fd);
+                        std::lock_guard<std::mutex> lock(connection_mutex);
+                        connection.erase(client_fd);
+                        return; 
+                    }
+                    
+                    // 【第二道防线：安全获取连接】
                     std::shared_ptr<HttpConnection> conn_ptr;
                     {
                         std::lock_guard<std::mutex> lock(connection_mutex);
-                        if(connection.find(client_fd) == connection.end()) {
-                            return;
-                        }
-                        conn_ptr = connection[client_fd];
+                        auto it = connection.find(client_fd);
+                        if (it == connection.end()) return;
+                        conn_ptr = it->second;
                     }
-                  
-                    int saveErrno = 0;
-                    ssize_t bytes_read = conn_ptr->readBuff.ReadFd(client_fd, &saveErrno);
-                
-                    if(bytes_read > 0) {
-                        // 核心状态机循环解析
-                        while (conn_ptr->parser.parse(conn_ptr->readBuff) == GET_REQUEST) {
-                            std::string path = conn_ptr->parser.request_path; 
-                            std::string method = conn_ptr->parser.method;
-                            std::string status_line, html_body;
-                            
-                            if(method == "POST"){
-                                auto post_data = ParsePostFormData(conn_ptr->parser.body_data);
-                                std::string user = post_data["username"];
-                                std::string pwd = post_data["password"];
-                                if(path == "/login"){
-                                    if(VerifyUser(user, pwd, true)){
-                                        path = "/";
-                                    } else {
-                                        path = "/error.html";
-                                    }
-                                } else if(path == "/register") {
-                                    if(VerifyUser(user, pwd, false)){
-                                        path = "/user";
-                                    } else {
-                                        path = "/error.html";
+                    
+                    bool is_read = (ready_events & EPOLLIN);
+                    bool is_write = (ready_events & EPOLLOUT);
+
+                    // ==========================================
+                    // 轨道 1：EPOLLIN（处理新发来的请求）
+                    // ==========================================
+                    if (is_read) {
+                        int saveErrno = 0;
+                        ssize_t bytes_read = conn_ptr->readBuff.ReadFd(client_fd, &saveErrno);
+                        
+                        if (bytes_read > 0) {
+                            while (conn_ptr->parser.parse(conn_ptr->readBuff) == GET_REQUEST) {
+                                std::string path = conn_ptr->parser.request_path; 
+                                std::string method = conn_ptr->parser.method;
+                                std::string status_line, html_body;
+                                
+                                // POST 逻辑
+                                if (method == "POST") {
+                                    auto post_data = ParsePostFormData(conn_ptr->parser.body_data);
+                                    std::string user = post_data["username"];
+                                    std::string pwd = post_data["password"];
+                                    if (path == "/login") {
+                                        path = VerifyUser(user, pwd, true) ? "/" : "/error.html";
+                                    } else if (path == "/register") {
+                                        path = VerifyUser(user, pwd, false) ? "/user" : "/error.html";
                                     }
                                 }
-                               // conn_ptr->readBuff.RetrieveAll(); // 清空缓冲区，准备接收下一次请求
-                            }
-                            
-                            if(path.empty()){
-                                status_line = "HTTP/1.1 400 Bad Request\r\n";
-                                std::string error_body = "<html><body><h1>400 Bad Request</h1><p>请求不合法</p></body></html>";
-                                std::string header = status_line + 
-                                         "Content-Type: text/html; charset=utf-8\r\n"
-                                         "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
-                                         "Connection: keep-alive\r\n\r\n" + error_body;
-                                conn_ptr->writeBuff.Append(header);
-                                int writeErrno = 0;
-                                conn_ptr->writeBuff.WriteFd(client_fd, &writeErrno);
-                            } else {
-                                auto it = router.find(path);
-                                if(it != router.end()){
-                                    std::string filepath = it->second;
-                                   // MmapFile html_file(filepath);
-                                    std::string status_line;
-                                    std::string header;
-                                    
-                                    if (!conn_ptr->MapFile(filepath)) {
-        // 如果文件找不到或者 mmap 失败，退回 404 逻辑
-        status_line = "HTTP/1.1 404 Not Found\r\n";
-        // ... (复制你原来的 404 HTML 生成逻辑) ...
-                                                         } else {
-        // 文件映射成功，准备发送报文
-                     status_line = "HTTP/1.1 200 OK\r\n";
-                  std::string header = status_line + 
-                 "Content-Type: text/html; charset=utf-8\r\n"
-                 "Content-Length: " + std::to_string(conn_ptr->file_size) + "\r\n"
-                 "Connection: keep-alive\r\n\r\n";
-        
-        conn_ptr->writeBuff.Append(header);
-                                        conn_ptr->iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
-                                        conn_ptr->iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
-                                        conn_ptr->iov[1].iov_base = conn_ptr->file_ptr;
-                                        conn_ptr->iov[1].iov_len = conn_ptr->file_size;
-
-                                        conn_ptr->iov_cnt = 2;
-// 极其重要：在发送前，必须初始化还需要发送的总字节数！
-                                        conn_ptr->bytes_have_send = 0;
-                                        conn_ptr->bytes_to_send = conn_ptr->writeBuff.ReadableBytes() + conn_ptr->file_size;
-                                        ssize_t bytes_sent = writev(client_fd, conn_ptr->iov, conn_ptr->iov_cnt);
-                                        if(bytes_sent < 0){
-                                            if(errno==EAGAIN){
-                                                struct epoll_event ev{};
-                                                ev.events=EPOLLOUT | EPOLLET | EPOLLONESHOT;
-                                                ev.data.fd=client_fd;
-                                                epoll_ctl(epoll_fd,EPOLL_CTL_MOD,client_fd,&ev);
-                                                return;
-
-                                            }
-                                        }
-                                        else{
-                                            conn_ptr->bytes_have_send+=bytes_sent;
-                                            conn_ptr->bytes_to_send-=bytes_sent;
-                                            if(conn_ptr->bytes_have_send>=conn_ptr->writeBuff.ReadableBytes()){
-                                                conn_ptr->iov[0].iov_len=0;
-                                                size_t file_offset = conn_ptr->bytes_have_send-conn_ptr->writeBuff.ReadableBytes();
-                                                conn_ptr->iov[1].iov_base=conn_ptr->file_ptr+file_offset;
-                                                conn_ptr->iov[1].iov_len=conn_ptr->bytes_to_send;
-                                            }else{
-                                                conn_ptr->iov[0].iov_base = (char*)conn_ptr->writeBuff.Peek() + conn_ptr->bytes_have_send;
-                                                conn_ptr->iov[0].iov_len -= bytes_sent;
-                                            }
-                                            struct epoll_event ev{};
-                                            ev.events=EPOLLOUT | EPOLLET | EPOLLONESHOT;
-                                            ev.data.fd =client_fd;
-                                            epoll_ctl(epoll_fd,EPOLL_CTL_MOD,client_fd,&ev);
-                                            return;
-                                        }
-                                    }
-                                } 
-                                // ✅ 修复黑洞：如果找不到路由，返回 404
-                                else {
-                                    status_line = "HTTP/1.1 404 Not Found\r\n";
-                                    std::string error_body = "<html><body><h1>404 Not Found</h1><p>The requested URL was not found on this server.</p></body></html>";
+                                
+                                // 组装报文逻辑
+                                if (path.empty()) {
+                                    status_line = "HTTP/1.1 400 Bad Request\r\n";
+                                    std::string error_body = "<html><body><h1>400 Bad Request</h1><p>请求不合法</p></body></html>";
                                     std::string header = status_line + 
                                                          "Content-Type: text/html; charset=utf-8\r\n"
                                                          "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
                                                          "Connection: keep-alive\r\n\r\n" + error_body;
                                     conn_ptr->writeBuff.Append(header);
-                                    int writeErrno = 0;
-                                    conn_ptr->writeBuff.WriteFd(client_fd, &writeErrno);
+                                    conn_ptr->iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
+                                    conn_ptr->iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
+                                    conn_ptr->iov_cnt = 1;
+                                    conn_ptr->file_size = 0;
+                                } else {
+                                    auto it = router.find(path);
+                                    if (it != router.end()) {
+                                        std::string filepath = it->second;
+                                        if (!conn_ptr->MapFile(filepath)) {
+                                            status_line = "HTTP/1.1 404 Not Found\r\n";
+                                            std::string error_body = "<html><body><h1>404 Not Found</h1></body></html>";
+                                            std::string header = status_line + 
+                                                                 "Content-Type: text/html; charset=utf-8\r\n"
+                                                                 "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
+                                                                 "Connection: keep-alive\r\n\r\n" + error_body;
+                                            conn_ptr->writeBuff.Append(header);
+                                            conn_ptr->iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
+                                            conn_ptr->iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
+                                            conn_ptr->iov_cnt = 1;
+                                            conn_ptr->file_size = 0;
+                                        } else {
+                                            status_line = "HTTP/1.1 200 OK\r\n";
+                                            std::string header = status_line + 
+                                                                 "Content-Type: text/html; charset=utf-8\r\n"
+                                                                 "Content-Length: " + std::to_string(conn_ptr->file_size) + "\r\n"
+                                                                 "Connection: keep-alive\r\n\r\n";
+                                            conn_ptr->writeBuff.Append(header);
+                                            
+                                            conn_ptr->iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
+                                            conn_ptr->iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
+                                            conn_ptr->iov[1].iov_base = conn_ptr->file_ptr;
+                                            conn_ptr->iov[1].iov_len = conn_ptr->file_size;
+                                            conn_ptr->iov_cnt = 2;
+                                        }
+                                    } else {
+                                        status_line = "HTTP/1.1 404 Not Found\r\n";
+                                        std::string error_body = "<html><body><h1>404 Not Found</h1></body></html>";
+                                        std::string header = status_line + 
+                                                             "Content-Type: text/html; charset=utf-8\r\n"
+                                                             "Content-Length: " + std::to_string(error_body.length()) + "\r\n"
+                                                             "Connection: keep-alive\r\n\r\n" + error_body;
+                                        conn_ptr->writeBuff.Append(header);
+                                        conn_ptr->iov[0].iov_base = const_cast<char*>(conn_ptr->writeBuff.Peek());
+                                        conn_ptr->iov[0].iov_len = conn_ptr->writeBuff.ReadableBytes();
+                                        conn_ptr->iov_cnt = 1;
+                                        conn_ptr->file_size = 0;
+                                    }
                                 }
+
+                                // 统一初始化发送参数，调用 FlushResponse
+                                conn_ptr->bytes_have_send = 0;
+                                conn_ptr->bytes_to_send = conn_ptr->writeBuff.ReadableBytes() + conn_ptr->file_size;
+                                
+                                int write_errno = 0;
+                                if (!conn_ptr->FlushResponse(client_fd, write_errno)) {
+                                    if (write_errno == EAGAIN || write_errno == EWOULDBLOCK) {
+                                        struct epoll_event ev{};
+                                        ev.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                                        ev.data.fd = client_fd;
+                                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev);
+                                        return; 
+                                    } else {
+                                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                                        close(client_fd);
+                                        std::lock_guard<std::mutex> lock(connection_mutex);
+                                        connection.erase(client_fd);
+                                        return;
+                                    }
+                                }
+
+                                conn_ptr->ClearResponseState();
+
+                                // 重置状态机，更新定时器
+                                conn_ptr->parser.reset(); 
+                                long long new_expire = get_current_time() + 10000; 
+                                conn_ptr->last_expire_time = new_expire;
+                                {
+                                    std::lock_guard<std::mutex> t_lock(timer_mutex);
+                                    timer_heap.push({client_fd, new_expire});   
+                                }
+                            } // while 结束
+
+                            struct epoll_event ev{};
+                            ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT; 
+                            ev.data.fd = client_fd;
+                            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev); 
+                        }
+                        else if (bytes_read == 0 || (bytes_read < 0 && saveErrno != EAGAIN)) { 
+                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                            close(client_fd);
+                            std::lock_guard<std::mutex> lock(connection_mutex);
+                            connection.erase(client_fd);
+                        }
+                    }
+
+                    // ==========================================
+                    // 轨道 2：EPOLLOUT（专供大文件断点补发的通道）
+                    // ==========================================
+                    else if (is_write) {
+                        int write_errno = 0;
+
+                        if (!conn_ptr->FlushResponse(client_fd, write_errno)) {
+                            if (write_errno == EAGAIN || write_errno == EWOULDBLOCK) {
+                                struct epoll_event ev{};
+                                ev.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                                ev.data.fd = client_fd;
+                                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev) < 0) {
+                                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                                    close(client_fd);
+                                    std::lock_guard<std::mutex> lock(connection_mutex);
+                                    connection.erase(client_fd);
+                                }
+                                return;
                             }
-                            
-                            // 网页发完了，重置定时器，清空读缓冲区，准备接收下一次请求
-                           // ✅ 抢救方案：重置状态机大脑，绝不能清空 readBuff（因为 readBuff 还要留着处理下个粘包请求）
-                            conn_ptr->parser.reset(); 
-                            
-                            long long new_expire = get_current_time() + 10000; 
-                            conn_ptr->last_expire_time = new_expire;
-                            {
-                                std::lock_guard<std::mutex> t_lock(timer_mutex);
-                                timer_heap.push({client_fd, new_expire});   
-                            }
+
+                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                            close(client_fd);
+                            std::lock_guard<std::mutex> lock(connection_mutex);
+                            connection.erase(client_fd);
+                            return;
                         }
 
-                        // 重置 EPOLLET，准备接收下一次请求
-                        struct epoll_event ev{};
-                        ev.events = EPOLLIN | EPOLLONESHOT; 
-                        ev.data.fd = client_fd;
-                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev); 
+                        conn_ptr->ClearResponseState();
 
-                    } 
-                    else if (bytes_read == 0 || (bytes_read < 0 && saveErrno != EAGAIN)) { 
-                        close(client_fd);
-                        std::lock_guard<std::mutex> lock(connection_mutex);
-                        connection.erase(client_fd);
+                        struct epoll_event ev{};
+                        ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                        ev.data.fd = client_fd;
+                        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &ev) < 0) {
+                            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                            close(client_fd);
+                            std::lock_guard<std::mutex> lock(connection_mutex);
+                            connection.erase(client_fd);
+                        }
                     }
                 });
             }
-        }
-    }
-    
+           }   }
     close(server_fd); 
     close(epoll_fd); 
     return 0;
+}
+        
