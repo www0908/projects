@@ -316,6 +316,42 @@ struct HttpConnection {
         close(fd);
         return true;
     }
+    bool Read(int fd) {
+    int saveErrno = 0;
+    while (true) {
+        ssize_t len = readBuff.ReadFd(fd, &saveErrno);
+        if (len > 0) {
+            continue; // 只要能读就继续榨干缓冲区
+        } else if (len == 0) {
+            return false; // 对端关闭
+        } else {
+            if (saveErrno == EINTR) continue; // 假中断，重试
+            if (saveErrno == EAGAIN || saveErrno == EWOULDBLOCK) {
+                break; // 榨干了，挂起交还控制权
+            }
+            return false; // 致命错误
+        }
+    }
+    return true;
+}
+    bool Write(int fd) {
+    int saveErrno = 0;
+    while (true) {
+        ssize_t len = writeBuff.WriteFd(fd, &saveErrno);
+        if (len > 0) {
+            if (writeBuff.ReadableBytes() == 0) return true; // 发送完毕
+            continue; 
+        } else if (len == 0) {
+            return false;
+        } else {
+            if (saveErrno == EINTR) continue;
+            if (saveErrno == EAGAIN || saveErrno == EWOULDBLOCK) {
+                return true; // 发送缓冲区满，挂起等待下次 EPOLLOUT
+            }
+            return false;
+        }
+    }
+}
     void ClearResponseState() {
         UnmapFile(); // 彻底发完一个网页后，主动释放内存
         writeBuff.RetrieveAll();
@@ -407,32 +443,51 @@ int main(){
     std::priority_queue<TimerNode> timer_heap; // 用于存储定时器节点的优先队列
     std::mutex timer_mutex; // 保护 timer_heap 的互斥锁
     
-    int epoll_fd = epoll_create1(0);// 创建epoll实例
-    int server_fd = socket(AF_INET,SOCK_STREAM,0);
-    if(server_fd < 0){
-        LOG_ERROR("Socket 创建失败");
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        LOG_ERROR("创建 Server Socket 失败! errno: %d", errno);
+        return -1; // 初始化失败直接退出，不留后患
+    }
+    
+    int optval = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+        LOG_ERROR("设置端口复用失败! errno: %d", errno);
+        close(server_fd);
         return -1;
     }
     
-    int opt = 1;//设置套接字选项
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));// 设置套接字选项，允许地址重用
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(8080);
     
-    sockaddr_in address{};//定义服务器地址结构体
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;// 绑定到所有可用的网络接口
-    address.sin_port = htons(PORT);// 将端口号转换为网络字节序
-    
-    if(bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0){
-        LOG_ERROR("绑定失败");
+   if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        LOG_ERROR("绑定端口失败! errno: %d", errno);
+        close(server_fd); // 失败路径必须清理之前创建的 fd
         return -1;
     }
-    
-    if(listen(server_fd, 5) < 0){
-        LOG_ERROR("监听失败");
+    if (listen(server_fd, 1024) < 0) { // 1024 是全连接队列长度
+        LOG_ERROR("监听端口失败! errno: %d", errno);
+        close(server_fd);
         return -1;
     }
+    int epoll_fd = epoll_create1(0);
+    if(epoll_fd<0){
+        LOG_ERROR("创建EPOLL实例失败！ errno:%d",errno);
+        close(server_fd);
+        return -1;
+
+    }
+    int old_option =fcntl (server_fd,F_GETFL);
+    if(old_option<0 || fcntl(server_fd,F_SETFL, old_option | O_NONBLOCK)<0){
+        LOG_ERROR("设置 server_fd 非阻塞失败! errno: %d", errno);
+        close(epoll_fd);
+        close(server_fd);
+        return -1;
+    }
+
     
-    set_nonblocking(server_fd);// 设置服务器套接字为非阻塞模式
+   
     
     struct epoll_event ev{};
     ev.events = EPOLLIN; // 设置事件类型为可读事件
@@ -502,13 +557,13 @@ int main(){
                 }
             } 
            // ✅ 修复了极其致命的优先级括号问题
+           // ✅ 修复了极其致命的优先级括号问题，并补齐了全部变量捕获
             else if (events[i].events & (EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP)) {
                 const int client_fd = events[i].data.fd;
                 const uint32_t ready_events = events[i].events;
                 
                 // 【后厨处理业务】
-                pool.enqueue([client_fd, ready_events, &connection, &connection_mutex, &router, &timer_heap, &timer_mutex, epoll_fd]{
-                    
+                EnqueueResult res = pool.AddTask([client_fd, ready_events, epoll_fd, &connection, &connection_mutex, &router, &timer_heap, &timer_mutex]() {
                     // 【第一道防线：异常拦截】
                     if (ready_events & (EPOLLERR | EPOLLHUP)) {
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
@@ -658,7 +713,6 @@ int main(){
                             connection.erase(client_fd);
                         }
                     }
-
                     // ==========================================
                     // 轨道 2：EPOLLOUT（专供大文件断点补发的通道）
                     // ==========================================
@@ -698,11 +752,31 @@ int main(){
                             connection.erase(client_fd);
                         }
                     }
-                });
+                }); // <--- 后厨 Lambda 到此结束
+
+                // ==========================================
+                // 【前台接盘：处理线程池拒单，执行熔断拔管】
+                // ==========================================
+                if (res == EnqueueResult::QUEUE_FULL) {
+                    static int dropCount = 0;
+                    if (++dropCount % 100 == 1) { 
+                        LOG_ERROR("线程池满载，触发限流熔断！累计丢弃: %d 个请求", dropCount);
+                    }
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                    close(client_fd);
+                    std::lock_guard<std::mutex> lock(connection_mutex);
+                    connection.erase(client_fd);
+                } 
+                else if (res == EnqueueResult::POOL_CLOSED) {
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                    close(client_fd);
+                    std::lock_guard<std::mutex> lock(connection_mutex);
+                    connection.erase(client_fd);
+                }
             }
-           }   }
     close(server_fd); 
     close(epoll_fd); 
     return 0;
+}
 }
         

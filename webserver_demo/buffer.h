@@ -8,9 +8,10 @@
 #include<cassert>
 #include<sys/uio.h>
 #include<unistd.h>
+#include<stdexcept>
 class Buffer{
 public:
-explicit Buffer(int initBuffSize = 1024);
+Buffer(int initBuffSize = 1024);
 ~Buffer() = default;
 size_t WritableBytes () const;
 size_t ReadableBytes () const;
@@ -38,8 +39,8 @@ char * BeginPtr_();
 const char * BeginPtr_() const;
 
 std::vector<char> buffer_;
-std::atomic<std::size_t> readPos_;
-std::atomic<std::size_t> writePos_;
+size_t readPos_;
+size_t writePos_;
 
 
 };

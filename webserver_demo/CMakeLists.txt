@@ -1,36 +1,22 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 project(WebServerDemo CXX)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -pthread")
-# 设置 C++ 标准
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# 寻找线程库（服务器多线程必选）
+set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+find_path(MYSQL_INCLUDE_DIR NAMES mysql/mysql.h)
+if(NOT MYSQL_INCLUDE_DIR)
+    message(FATAL_ERROR "MySQL/MariaDB client headers not found (mysql/mysql.h)")
+endif()
+find_library(MYSQLCLIENT_LIBRARY NAMES mysqlclient mariadb)
+if(NOT MYSQLCLIENT_LIBRARY)
+    message(FATAL_ERROR "MySQL/MariaDB client library not found (mysqlclient or mariadb)")
+endif()
 
-# 生成可执行文件 webserver，包含当前目录下的关键源文件
-add_executable(webserver
-    epollserver.cpp
-    sqlConnPool.cpp
-    buffer.cpp
-    
-)
-
-# 链接多线程库与 MySQL 客户端库
-target_link_libraries(webserver PRIVATE
-    Threads::Threads
-    mysqlclient
-    crypto
-    ssl
-)
-add_executable(test_buffer
-test_buffer.cpp 
-buffer.cpp 
-)
-target_link_libraries(test_buffer PRIVATE 
-Threads::Threads 
-)
-
-enable_testing()
-add_test(NAME buffer_tests COMMAND test_buffer)
+add_executable(webserver epollserver.cpp sqlConnPool.cpp)
+target_include_directories(webserver PRIVATE ${MYSQL_INCLUDE_DIR})
+target_link_libraries(webserver PRIVATE Threads::Threads OpenSSL::Crypto ${MYSQLCLIENT_LIBRARY})
+target_compile_features(webserver PRIVATE cxx_std_14)
+target_compile_options(webserver PRIVATE -Wall -Wextra -Wpedantic)
