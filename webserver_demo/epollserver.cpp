@@ -24,6 +24,9 @@
 #include "sqlConnPool.h"
 #include "crypto_util.h"
 #include <sys/uio.h> // writev 需要用到
+#include<cstdlib>
+#include<cctype>
+#include<cerrno>
 
 #define PORT 8080
 
@@ -199,14 +202,16 @@ class HttpParser{
 private:
     CheckState current_state;
     int content_length_;
+    int parsed_header_bytes_;
+    bool content_length_seen_;
 public:
     std::string request_path;
     std::string method;
     std::string body_data;
+    bool is_keep_alive_ ;
       
     HttpParser(){
-        current_state = STATE_REQUEST_LINE;
-        content_length_ = 0;
+       reset();
     }
       
     void reset(){
@@ -215,6 +220,9 @@ public:
         method.clear();
         body_data.clear();
         content_length_ = 0;
+        parsed_header_bytes_=0;
+        content_length_seen_=0;
+        is_keep_alive_=false;
     }
       
     HttpCode parse(Buffer& buffer){
@@ -227,11 +235,19 @@ public:
                 current_state = STATE_FINISH;
                 return GET_REQUEST;
             }
-            
             const char* crlf = std::search(buffer.Peek(), buffer.BeginWriteConst(), "\r\n", "\r\n"+2);
+            
             if(crlf == buffer.BeginWriteConst()){
+                 if (buffer.ReadableBytes() > 65536) {
+                return BAD_REQUEST; 
+            }
                 return NO_REQUEST;
             }
+            int current_line_len = crlf - buffer.Peek() + 2;
+            parsed_header_bytes_ += current_line_len;
+            if (parsed_header_bytes_ > 65536) {
+            return BAD_REQUEST; // 头部累积超限，果断拒绝
+           }
             
             std::string line(buffer.Peek(), crlf);
             buffer.RetrieveUntil(crlf + 2);
@@ -239,10 +255,24 @@ public:
             switch (current_state){
                 case STATE_REQUEST_LINE:{
                     if(line.empty()) return BAD_REQUEST;
-                    std::istringstream iss(line);
-                    std::string version;
-                    iss >> this->method >> this->request_path >> version;
-                    current_state = STATE_HEADER;
+                    size_t space1=line.find(' ');
+                    if(space1 == std::string::npos) return BAD_REQUEST;
+                    size_t space2=line.find(' ',space1+1);
+                    if(space2 == std::string::npos) return BAD_REQUEST;
+                    this->method=line.substr(0,space1);
+                    this->request_path=line.substr(space1+1,space2-space1-1);
+                    std::string version=line.substr(space2+1);
+                    //检验方法
+                    if(this->request_path.empty()||this->request_path[0]!='/'){
+                        return BAD_REQUEST;
+                    }
+                    if (this->request_path.empty() || this->request_path[0] != '/') {
+                        return BAD_REQUEST;
+                    }
+                    if(version!="HTTP/1.1"&&version!="HTTP/1.0"){
+                        return BAD_REQUEST;
+                    }
+                    current_state=STATE_HEADER;
                     break;
                 }
                 case STATE_HEADER:{
@@ -256,12 +286,54 @@ public:
                             return GET_REQUEST;
                         }
                     }
-                    if(line.find("Content-Length:") != std::string::npos){
-                        size_t pos = line.find(":");
-                        if(pos != std::string::npos){
-                            content_length_ = std::stoi(line.substr(pos+1));
-                        }
+                    size_t colon_pos=line.find(':');
+                    if(colon_pos== std::string::npos){
+                        return BAD_REQUEST;
+
                     }
+                    std::string key = line.substr(0, colon_pos);
+                    std::string value = line.substr(colon_pos + 1);
+                    size_t value_start = value.find_first_not_of(" \t");
+                    if(value_start!=std::string::npos){
+                        value=value.substr(value_start);
+                    }
+                    else{
+                        value.clear();
+                    }
+                    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                       if (key == "content-length") {
+                    // 为什么要这样写：用独立 bool 拦截重复，即使前一个是 Content-Length: 0 也能精准捕获。
+                       if (content_length_seen_) return BAD_REQUEST;
+                      content_length_seen_ = true;
+                       if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+                        return BAD_REQUEST;
+                          } 
+                          errno=0;
+                          char* end_ptr = nullptr;
+                          long long len = std::strtoll(value.c_str(), &end_ptr, 10);
+
+                          if(errno==ERANGE||len < 0||*end_ptr !='\0'){
+                            return BAD_REQUEST;
+                          }
+                          if(len>10*1024*1024){
+                            return BAD_REQUEST;
+                          }
+                          content_length_=static_cast<int>(len);
+                    }
+                    else if (key == "transfer-encoding") {
+                    // 容易踩的坑：不能只判断 chunked。只要出现这个头，说明客户端想用某种编码，我们当前不支持，必须无差别拒绝，否则会导致后续报文边界错乱。
+                    return BAD_REQUEST;
+                          }
+                   else if (key == "connection") {
+                    // 只在需要比较协议 Token 时，按需转小写
+                    std::string lower_value = value;
+                    std::transform(lower_value.begin(), lower_value.end(), lower_value.begin(), [](unsigned char c) { return std::tolower(c); });
+                    
+                    if (lower_value.find("keep-alive") != std::string::npos) {
+                        this->is_keep_alive_ = false; // 当前第一轮强制降级短连接
+                    }
+                }
                     break;
                 }
                 default: 

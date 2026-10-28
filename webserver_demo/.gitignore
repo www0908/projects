@@ -19,3 +19,5 @@ Makefile
 *.d
 *.out
 webserver # 假设这是你最后生成的可执行文件名*.log
+server.log
+test_buffer
