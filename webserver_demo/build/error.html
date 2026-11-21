@@ -1,1 +1,139 @@
-<h1>Hello</h1>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="page-id" content="error" />
+  <title>认证失败 — WebServer</title>
+  <style>
+    :root {
+      --bg-page: #F5F5F7;
+      --bg-surface: rgba(255, 255, 255, 0.82);
+      --text-primary: #1D1D1F;
+      --text-secondary: #6E6E73;
+      --apple-blue: #0071E3;
+      --apple-blue-hover: #0077ED;
+      --danger: #D70015;
+      --danger-bg: rgba(255, 59, 48, 0.08);
+      --border-hairline: rgba(0, 0, 0, 0.08);
+      --ease-apple: cubic-bezier(0.22, 1, 0.36, 1);
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background-color: var(--bg-page);
+      background-image: radial-gradient(800px 480px at 50% 0%, #FFFFFF 0%, rgba(255, 255, 255, 0) 70%);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .main {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 440px;
+      padding: 42px 34px;
+      border-radius: 24px;
+      background: var(--bg-surface);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border: 1px solid var(--border-hairline);
+      box-shadow: 0 20px 48px rgba(0, 0, 0, 0.06);
+      text-align: center;
+      animation: appleEnter 0.65s var(--ease-apple) both;
+    }
+
+    @keyframes appleEnter {
+      from { opacity: 0; transform: translate3d(0, 20px, 0) scale(0.985); }
+      to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 5px 12px;
+      border-radius: 980px;
+      background: var(--danger-bg);
+      color: var(--danger);
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 10px;
+    }
+
+    p {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--text-secondary);
+      margin-bottom: 28px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      padding: 11px 22px;
+      border-radius: 980px;
+      font-size: 14px;
+      font-weight: 500;
+      text-decoration: none;
+      transition: background 0.2s ease, transform 0.18s var(--ease-apple);
+    }
+
+    .btn:active {
+      transform: scale(0.97);
+    }
+
+    .btn-primary {
+      background: var(--apple-blue);
+      color: #FFFFFF;
+    }
+
+    .btn-primary:hover {
+      background: var(--apple-blue-hover);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      color: var(--text-primary);
+    }
+
+    .btn-secondary:hover {
+      background: #FFFFFF;
+    }
+  </style>
+</head>
+<body>
+  <main class="main">
+    <section class="card">
+      <div class="badge">无法验证身份</div>
+      <h1>登录或注册未成功</h1>
+      <p>用户名或密码有误，或者注册时该用户名已被使用。请返回认证页面重试。</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="/user">返回登录 / 注册</a>
+        <a class="btn btn-secondary" href="/">返回概览</a>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

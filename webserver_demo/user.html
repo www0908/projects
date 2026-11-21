@@ -1,1 +1,635 @@
-<h1>Hello</h1>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="page-id" content="auth" />
+  <title>账户认证 — WebServer</title>
+  <style>
+    :root {
+      --bg-page: #F5F5F7;
+      --bg-surface: rgba(255, 255, 255, 0.78);
+      --bg-input: rgba(255, 255, 255, 0.92);
+      --bg-track: #E8E8ED;
+      --text-primary: #1D1D1F;
+      --text-secondary: #6E6E73;
+      --text-muted: #86868B;
+      --apple-blue: #0071E3;
+      --apple-blue-hover: #0077ED;
+      --apple-blue-active: #0066CC;
+      --border-hairline: rgba(0, 0, 0, 0.08);
+      --border-input: rgba(0, 0, 0, 0.14);
+      --danger: #D70015;
+      --danger-bg: rgba(255, 59, 48, 0.08);
+      --success: #1D8348;
+      --success-bg: rgba(40, 205, 65, 0.1);
+      --ease-apple: cubic-bezier(0.22, 1, 0.36, 1);
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      min-height: 100%;
+      background-color: var(--bg-page);
+      background-image:
+        radial-gradient(900px 540px at 50% -10%, #FFFFFF 0%, rgba(255, 255, 255, 0) 70%),
+        radial-gradient(600px 400px at 85% 95%, rgba(0, 113, 227, 0.04) 0%, transparent 70%);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* 顶部极简导航栏 */
+    .navbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(245, 245, 247, 0.72);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border-bottom: 1px solid var(--border-hairline);
+    }
+
+    .navbar-inner {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text-primary);
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--apple-blue);
+    }
+
+    .nav-back {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: 980px;
+      border: 1px solid var(--border-hairline);
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--text-primary);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.2s ease, transform 0.18s var(--ease-apple);
+    }
+
+    .nav-back:hover {
+      background: #FFFFFF;
+    }
+
+    .nav-back:active {
+      transform: scale(0.96);
+    }
+
+    /* 主容器 */
+    .main {
+      min-height: calc(100vh - 58px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px 64px;
+    }
+
+    .auth-card {
+      width: 100%;
+      max-width: 420px;
+      padding: 40px 36px 34px;
+      border-radius: 24px;
+      background: var(--bg-surface);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border: 1px solid var(--border-hairline);
+      box-shadow:
+        0 20px 48px rgba(0, 0, 0, 0.06),
+        0 2px 8px rgba(0, 0, 0, 0.03);
+      animation: appleEnter 0.68s var(--ease-apple) both;
+    }
+
+    @keyframes appleEnter {
+      from {
+        opacity: 0;
+        transform: translate3d(0, 22px, 0) scale(0.985);
+      }
+      to {
+        opacity: 1;
+        transform: translate3d(0, 0, 0) scale(1);
+      }
+    }
+
+    .auth-card.shake {
+      animation: gentleShake 0.4s var(--ease-apple) both;
+    }
+
+    @keyframes gentleShake {
+      0%, 100% { transform: translateX(0); }
+      20% { transform: translateX(-6px); }
+      40% { transform: translateX(6px); }
+      60% { transform: translateX(-4px); }
+      80% { transform: translateX(4px); }
+    }
+
+    .stagger {
+      opacity: 0;
+      animation: fadeSlide 0.56s var(--ease-apple) var(--d, 0.05s) forwards;
+    }
+
+    @keyframes fadeSlide {
+      from { opacity: 0; transform: translate3d(0, 10px, 0); }
+      to { opacity: 1; transform: translate3d(0, 0, 0); }
+    }
+
+    .card-header {
+      text-align: center;
+      margin-bottom: 26px;
+    }
+
+    .card-eyebrow {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--apple-blue);
+      margin-bottom: 8px;
+    }
+
+    .card-title {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      color: var(--text-primary);
+      margin-bottom: 6px;
+    }
+
+    .card-subtitle {
+      font-size: 14px;
+      line-height: 1.5;
+      color: var(--text-secondary);
+    }
+
+    /* 分段控制器 Tab */
+    .segmented {
+      position: relative;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      padding: 3px;
+      border-radius: 12px;
+      background: var(--bg-track);
+      margin-bottom: 24px;
+    }
+
+    .segmented-pill {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: calc(50% - 3px);
+      height: calc(100% - 6px);
+      border-radius: 9.5px;
+      background: #FFFFFF;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+      transition: transform 0.36s var(--ease-apple);
+      pointer-events: none;
+    }
+
+    .segmented[data-mode="register"] .segmented-pill {
+      transform: translateX(100%);
+    }
+
+    .seg-btn {
+      position: relative;
+      z-index: 1;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      font-weight: 500;
+      padding: 8px 0;
+      cursor: pointer;
+      transition: color 0.24s ease;
+    }
+
+    .seg-btn.active {
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+
+    /* 表单控件 */
+    .field {
+      margin-bottom: 16px;
+    }
+
+    .field.hidden {
+      display: none;
+    }
+
+    .field-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+      margin-bottom: 6px;
+    }
+
+    .input-wrap {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+
+    .input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border-input);
+      background: var(--bg-input);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 15px;
+      outline: none;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+    }
+
+    .input--pwd {
+      padding-right: 58px;
+    }
+
+    .input::placeholder {
+      color: var(--text-muted);
+    }
+
+    .input:focus {
+      border-color: var(--apple-blue);
+      background: #FFFFFF;
+      box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.16);
+    }
+
+    .toggle-pwd {
+      position: absolute;
+      right: 10px;
+      border: none;
+      background: transparent;
+      color: var(--apple-blue);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 4px 8px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+
+    .toggle-pwd:hover {
+      background: rgba(0, 113, 227, 0.08);
+    }
+
+    /* 状态提示 */
+    .alert {
+      display: none;
+      padding: 11px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.45;
+      margin-bottom: 16px;
+      animation: fadeSlide 0.28s var(--ease-apple) forwards;
+    }
+
+    .alert.show {
+      display: block;
+    }
+
+    .alert--error {
+      background: var(--danger-bg);
+      color: var(--danger);
+      border: 1px solid rgba(255, 59, 48, 0.2);
+    }
+
+    .alert--success {
+      background: var(--success-bg);
+      color: var(--success);
+      border: 1px solid rgba(40, 205, 65, 0.22);
+    }
+
+    /* 主按钮 */
+    .btn-submit {
+      width: 100%;
+      margin-top: 6px;
+      padding: 13px 20px;
+      border: none;
+      border-radius: 980px;
+      background: var(--apple-blue);
+      color: #FFFFFF;
+      font-family: var(--font-sans);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: background 0.2s ease, transform 0.18s var(--ease-apple), box-shadow 0.2s ease;
+    }
+
+    .btn-submit:hover {
+      background: var(--apple-blue-hover);
+      box-shadow: 0 6px 18px rgba(0, 113, 227, 0.24);
+    }
+
+    .btn-submit:active {
+      background: var(--apple-blue-active);
+      transform: scale(0.975);
+      box-shadow: none;
+    }
+
+    .btn-submit:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .spinner {
+      display: none;
+      width: 15px;
+      height: 15px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #FFFFFF;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+
+    .btn-submit.loading .spinner {
+      display: inline-block;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .card-footer {
+      margin-top: 24px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border-hairline);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .endpoint-pill {
+      padding: 3px 10px;
+      border-radius: 980px;
+      background: rgba(0, 0, 0, 0.04);
+      color: var(--text-secondary);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+    }
+
+    @media (max-width: 480px) {
+      .auth-card {
+        padding: 32px 24px 28px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="navbar">
+    <div class="navbar-inner">
+      <a class="brand" href="/">
+        <span class="brand-dot"></span>
+        <span>WebServer</span>
+      </a>
+      <a class="nav-back" href="/">&larr; 返回概览</a>
+    </div>
+  </header>
+
+  <main class="main">
+    <section class="auth-card" id="authCard">
+      <div class="card-header stagger" style="--d:0.06s">
+        <div class="card-eyebrow">Epoll C++ Server</div>
+        <h1 class="card-title" id="cardTitle">登录账户</h1>
+        <p class="card-subtitle" id="cardSubtitle">使用你的凭证连接至服务器主控台。</p>
+      </div>
+
+      <div class="segmented stagger" style="--d:0.12s" id="modeTabs" data-mode="login">
+        <div class="segmented-pill"></div>
+        <button type="button" class="seg-btn active" id="tabLogin">登录</button>
+        <button type="button" class="seg-btn" id="tabRegister">注册</button>
+      </div>
+
+      <div class="alert" id="alertBox" role="alert"></div>
+
+      <form id="authForm" action="/login" method="POST" autocomplete="off">
+        <div class="field stagger" style="--d:0.18s">
+          <label class="field-label" for="username">用户名</label>
+          <div class="input-wrap">
+            <input class="input" type="text" id="username" name="username" placeholder="请输入用户名" required />
+          </div>
+        </div>
+
+        <div class="field stagger" style="--d:0.24s">
+          <label class="field-label" for="password">密码</label>
+          <div class="input-wrap">
+            <input class="input input--pwd" type="password" id="password" name="password" placeholder="请输入密码" required />
+            <button type="button" class="toggle-pwd" id="togglePwd">显示</button>
+          </div>
+        </div>
+
+        <div class="field hidden" id="confirmGroup">
+          <label class="field-label" for="confirmPassword">确认密码</label>
+          <div class="input-wrap">
+            <input class="input" type="password" id="confirmPassword" placeholder="请再次输入密码" />
+          </div>
+        </div>
+
+        <div class="stagger" style="--d:0.30s">
+          <button type="submit" class="btn-submit" id="submitBtn">
+            <span class="spinner" aria-hidden="true"></span>
+            <span id="submitText">继续</span>
+          </button>
+        </div>
+      </form>
+
+      <div class="card-footer stagger" style="--d:0.36s">
+        <span>SHA-256 · MySQL</span>
+        <span class="endpoint-pill" id="endpointPill">POST /login</span>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      const authCard = document.getElementById('authCard');
+      const modeTabs = document.getElementById('modeTabs');
+      const tabLogin = document.getElementById('tabLogin');
+      const tabRegister = document.getElementById('tabRegister');
+      const authForm = document.getElementById('authForm');
+      const confirmGroup = document.getElementById('confirmGroup');
+      const confirmInput = document.getElementById('confirmPassword');
+      const cardTitle = document.getElementById('cardTitle');
+      const cardSubtitle = document.getElementById('cardSubtitle');
+      const submitBtn = document.getElementById('submitBtn');
+      const submitText = document.getElementById('submitText');
+      const endpointPill = document.getElementById('endpointPill');
+      const alertBox = document.getElementById('alertBox');
+      const usernameInput = document.getElementById('username');
+      const passwordInput = document.getElementById('password');
+      const togglePwd = document.getElementById('togglePwd');
+
+      let mode = 'login';
+
+      function showAlert(type, msg) {
+        alertBox.className = 'alert show alert--' + type;
+        alertBox.textContent = msg;
+      }
+
+      function clearAlert() {
+        alertBox.className = 'alert';
+        alertBox.textContent = '';
+      }
+
+      function shakeCard() {
+        authCard.classList.remove('shake');
+        void authCard.offsetWidth;
+        authCard.classList.add('shake');
+      }
+
+      function setMode(nextMode) {
+        mode = nextMode;
+        modeTabs.setAttribute('data-mode', mode);
+        clearAlert();
+        if (mode === 'login') {
+          tabLogin.classList.add('active');
+          tabRegister.classList.remove('active');
+          confirmGroup.classList.add('hidden');
+          confirmInput.required = false;
+          authForm.action = '/login';
+          cardTitle.textContent = '登录账户';
+          cardSubtitle.textContent = '使用你的凭证连接至服务器主控台。';
+          submitText.textContent = '继续';
+          endpointPill.textContent = 'POST /login';
+        } else {
+          tabRegister.classList.add('active');
+          tabLogin.classList.remove('active');
+          confirmGroup.classList.remove('hidden');
+          confirmInput.required = true;
+          authForm.action = '/register';
+          cardTitle.textContent = '创建账户';
+          cardSubtitle.textContent = '新账户密码将经由服务端加盐 SHA-256 哈希存储。';
+          submitText.textContent = '注册账户';
+          endpointPill.textContent = 'POST /register';
+        }
+      }
+
+      tabLogin.addEventListener('click', () => setMode('login'));
+      tabRegister.addEventListener('click', () => setMode('register'));
+
+      if (new URLSearchParams(window.location.search).get('mode') === 'register') {
+        setMode('register');
+      }
+
+      togglePwd.addEventListener('click', () => {
+        const show = passwordInput.type === 'password';
+        passwordInput.type = show ? 'text' : 'password';
+        confirmInput.type = show ? 'text' : 'password';
+        togglePwd.textContent = show ? '隐藏' : '显示';
+      });
+
+      authForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        clearAlert();
+
+        const username = usernameInput.value.trim();
+        const password = passwordInput.value;
+
+        if (!username || !password) {
+          showAlert('error', '请填写完整的用户名和密码。');
+          shakeCard();
+          return;
+        }
+
+        if (mode === 'register' && password !== confirmInput.value) {
+          showAlert('error', '两次输入的密码不一致，请重新核对。');
+          shakeCard();
+          return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.classList.add('loading');
+        submitText.textContent = mode === 'login' ? '正在验证...' : '正在创建...';
+
+        try {
+          const body = new URLSearchParams({ username, password }).toString();
+          const res = await fetch(authForm.action, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body
+          });
+
+          const html = await res.text();
+          const doc = new DOMParser().parseFromString(html, 'text/html');
+          const meta = doc.querySelector('meta[name="page-id"]');
+          const pageId = meta ? meta.getAttribute('content') : '';
+
+          if (mode === 'login') {
+            if (pageId === 'home') {
+              sessionStorage.setItem('epoll_user', username);
+              showAlert('success', '验证通过，正在前往主控台...');
+              setTimeout(() => { window.location.href = '/'; }, 520);
+              return;
+            }
+            showAlert('error', '用户名或密码错误，请重试。');
+            shakeCard();
+          } else {
+            if (pageId === 'auth') {
+              showAlert('success', '注册成功，已为你切换至登录页面。');
+              setTimeout(() => {
+                setMode('login');
+                usernameInput.value = username;
+                passwordInput.value = '';
+                confirmInput.value = '';
+                showAlert('success', '账户已就绪，请点击继续登录。');
+              }, 500);
+              return;
+            }
+            showAlert('error', '注册失败：用户名可能已被占用。');
+            shakeCard();
+          }
+        } catch (err) {
+          showAlert('error', '网络请求失败：' + err.message);
+          shakeCard();
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.classList.remove('loading');
+          submitText.textContent = mode === 'login' ? '继续' : '注册账户';
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
