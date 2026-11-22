@@ -28,9 +28,107 @@
 #include<cctype>
 #include<cerrno>
 #include<csignal>
+#include <sys/sendfile.h>
+#include<regex>
 
 #define PORT 8080
+bool UrlDecode(const std::string& src,std::string& dest){
+  dest.clear();
+  for(size_t i=0;i<src.length();++i){
+    if(src[i]=='+'){
+        dest +=' ';
+    }
+    else if(src[i]=='%'){
+        if(i+2<src.length() &&std::isxdigit(src[i+1])&&std::isxdigit(src[i+2])){
+            int value;
+            sscanf(src.substr(i+1,2).c_str(),"%x",&value);
+            dest += static_cast<char>(value);
+            i+=2;
+        }
+        else{
+            return false;
+        }
+        
+        }
+        else{
+            dest+=src[i];
+    }
+  }
+  return true;
+ 
+}
+bool ParseFromData(const std::string& body,std::unordered_map<std::string,std::string> form_data){
+     form_data.clear();
+     size_t start=0;       
+     size_t end=body.find('&');
+     while(start<body.length()){
+        std::string kv=body.substr(start,end-start);
+        size_t eq_pos=kv.find('=');
 
+        if(eq_pos!=std::string::npos){
+            std::string key = kv.substr(0, eq_pos);
+            std::string raw_value = kv.substr(eq_pos + 1);
+            std::string decoded_value;
+            
+            if (!UrlDecode(raw_value, decoded_value)) return false;
+
+            if (form_data.count(key) > 0) return false;
+
+            form_data[key] = decoded_value;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+        end = body.find('&', start);
+     }       
+     return form_data.count("username") && form_data.count("password");
+}
+bool ValidateInput(const std::string& username, const std::string& password) {
+    // 用户名：4-16位，只能包含字母、数字、下划线、连字符
+    if (username.length() < 4 || username.length() > 16) return false;
+    static const std::regex user_reg("^[a-zA-Z0-9_-]+$");
+    if (!std::regex_match(username, user_reg)) return false;
+
+    // 密码：8-32位，拒绝纯空格或空值，允许常见符号
+    if (password.length() < 8 || password.length() > 32) return false;
+    
+    // 检查密码是否全为空格
+    bool all_space = true;
+    for (char c : password) {
+        if (!std::isspace(c)) {
+            all_space = false;
+            break;
+        }
+    }
+    if (all_space) return false;
+
+    return true;
+}
+const std::string STATIC_ROOT="/home/wjs/projects/wevserver_demo/resources/";
+
+std::string GetFileType(const std::string& path) {
+    size_t idx = path.find_last_of('.');
+    if (idx == std::string::npos) {
+        return "text/plain"; // 找不到后缀，默认当纯文本处理
+    }
+    
+    std::string ext = path.substr(idx);
+    
+    // 容易踩的坑：Windows 下很多文件后缀是大写（比如 .JPG 或 .HTML），
+    // 必须统一转成小写再判断，否则会导致匹配失败。
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+    if (ext == ".css") return "text/css";
+    if (ext == ".js") return "application/javascript";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".gif") return "image/gif";
+    if (ext == ".json") return "application/json";
+    if (ext == ".mp4") return "video/mp4";
+    if (ext == ".ico") return "image/x-icon";
+    
+    return "application/octet-stream"; // 未知类型当成二进制流下载
+}
 std::unordered_map<std::string,std::string> ParsePostFormData(const std::string& body){
     std::unordered_map<std::string,std::string> post_data;
     size_t start=0;
@@ -329,6 +427,45 @@ struct HttpConnection {
     char* file_ptr;
     size_t file_size;
     bool is_closed_by_peer;
+    int src_fd;
+    size_t file_size;
+   HttpConnection() : /* ... */ src_fd(-1), file_size(0) {}
+    ~HttpConnection() { CloseFile(); }
+    void CloseFile() {
+        if (src_fd != -1) {
+            close(src_fd);
+            src_fd = -1;
+        }
+        file_size = 0;
+    }
+    bool OpenFile(const std::string& filepath) {
+        CloseFile(); // 每次打开新文件前，先清理上一局的遗留物
+        
+        // 1. 检查是否存在及是否有读权限
+        src_fd = open(filepath.c_str(), O_RDONLY);
+        if (src_fd < 0) {
+            return false; 
+        }
+
+        struct stat stat_buf;
+        if (fstat(src_fd, &stat_buf) == 0) {
+            // 2. 容易踩的坑：黑客有可能请求一个合法的目录名！
+            // 如果不检查 S_ISREG（是否为普通文件），后续强行发给客户端会导致未定义行为。
+            if (S_ISDIR(stat_buf.st_mode) || !S_ISREG(stat_buf.st_mode)) {
+                CloseFile();
+                return false;
+            }
+            
+            // 3. 记录文件大小（0 字节也是合法的，这里直接照单全收）
+            file_size = stat_buf.st_size; 
+        } else {
+            // fstat 失败极其罕见，但也要兜底
+            CloseFile();
+            return false;
+        }
+        
+        return true; // 安检全数通过！
+    }
     HttpConnection() : readBuff(1024), writeBuff(1024), last_expire_time(0),iov_cnt(0), bytes_to_send(0),bytes_have_send(0), file_ptr(nullptr), file_size(0),is_closed_by_peer(false) {}
     ~HttpConnection(){
         UnmapFile();
@@ -398,13 +535,13 @@ struct HttpConnection {
         }
     }
 }
-    void ClearResponseState() {
-        UnmapFile(); // 彻底发完一个网页后，主动释放内存
-        writeBuff.RetrieveAll();
-        iov_cnt = 0;
-        bytes_to_send = 0;
-        bytes_have_send = 0;
-    }
+   void ClearResponseState() {
+    CloseFile(); // 替换掉原来的 UnmapFile()，安全关闭文件描述符 src_fd
+    writeBuff.RetrieveAll();
+    bytes_to_send = 0;
+    bytes_have_send = 0;
+    // iov_cnt 相关的逻辑彻底删掉，sendfile 不需要它了
+}
     bool PrepareIovForRemaining() {
         const size_t header_size = writeBuff.ReadableBytes();
 
@@ -439,29 +576,35 @@ struct HttpConnection {
     }
     // 返回 true 表示响应已全部发送；false 表示遇到 EAGAIN，等待 EPOLLOUT
 bool FlushResponse(int client_fd, int& saved_errno) {
-    while (bytes_have_send < bytes_to_send) {
-        PrepareIovForRemaining();
-
-        ssize_t n = writev(client_fd, iov, iov_cnt);
-        if (n > 0) {
-            bytes_have_send += static_cast<size_t>(n);
-            continue;
-        }
-
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            saved_errno = errno;
+   while(writeBuff.ReadableBytes()>0){
+    ssize_t n = write(client_fd,writeBuff.Peek(),writeBuff.ReadableBytes());
+    if(n>0){
+        if(errno==EINTR) continue;;
+        if(errno==EAGAIN||errno==EWOULDBLOCK){
+            saved_errno=errno;
             return false;
         }
-
-        saved_errno = (n == 0) ? EPIPE : errno;
         return false;
     }
+    writeBuff.Retrieve(n);
+   }
+   if(file_size>0&&src_fd!=-1){
+    while(bytes_have_send<file_size){
+        off_t  offset=bytes_have_send;
+        ssize_t n=sendfile(client_fd,src_fd,&offset,file_size-bytes_have_send);
+        if(n>0){
+            if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    saved_errno = errno;
+                    return false; // 大文件一次发不完，网卡塞满，等下一次 EPOLLOUT 唤醒继续发
+                }
+                return false;
+        }
+        bytes_have_send+=n;
+    }
+   }
+   return true;
 
-    return true;
 }
 }; // 结构体结束
 
@@ -475,8 +618,8 @@ int main(){
     signal(SIGPIPE,SIG_IGN);
     // 初始化数据库连接池
     SqlConnPool::Instance()->Init("127.0.0.1", 3306, "root", "123456", "webserver_db", 10);
-    ThreadPool pool(4);
-    
+    const size_t worker_count = 8; 
+    ThreadPool pool(worker_count);
     std::unordered_map<int,std::shared_ptr<HttpConnection>> connection; // 用于存储每个客户端的解析器实例
     std::mutex connection_mutex; // 保护 connection 的互斥锁
     
@@ -513,11 +656,10 @@ int main(){
         close(server_fd); // 失败路径必须清理之前创建的 fd
         return -1;
     }
-    if (listen(server_fd, 1024) < 0) { // 1024 是全连接队列长度
-        LOG_ERROR("监听端口失败! errno: %d", errno);
-        close(server_fd);
-        return -1;
-    }
+    if (listen(server_fd, SOMAXCONN) < 0) {
+    LOG_ERROR("监听失败");
+    return -1;
+      }
     int epoll_fd = epoll_create1(0);
     if(epoll_fd<0){
         LOG_ERROR("创建EPOLL实例失败！ errno:%d",errno);
@@ -573,49 +715,44 @@ int main(){
 
         for(int i = 0; i < nfds; i++){
             int fd = events[i].data.fd;
+            if (fd == server_fd) {
+        while (true) {
+        sockaddr_in client_addr{};
+        socklen_t client_addr_len = sizeof(client_addr);
 
-            if(fd == server_fd) {
-                // 【前台接待
-             while (true){
-                sockaddr_in client_addr{};
-                socklen_t client_addr_len = sizeof(client_addr);
-                int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len);
-                
-                if(client_fd < 0){
-                    if(errno==EINTR) continue;
-                    if(errno==EAGAIN||errno==EWOULDBLOCK) break;
-                    LOG_ERROR("accept 错误 errno:%d",errno);
-                    break;
-                }
-                
-              int old_option = fcntl(client_fd, F_GETFL);
-              if (old_option < 0 || fcntl(client_fd, F_SETFL, old_option | O_NONBLOCK) < 0) {
-              LOG_ERROR("设置非阻塞失败，放弃该连接。errno: %d", errno);
-              close(client_fd); // 容易踩的坑：失败了千万别忘了关掉拿到的 fd，否则泄露
-              continue; // 跳过当前这个出问题的连接，去接下一个
-                }
-                struct epoll_event ev{};
-                ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT|EPOLLRDHUP; 
-                ev.data.fd = client_fd;
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
-                LOG_ERROR("epoll_ctl 添加新连接失败。errno: %d", errno);
-                close(client_fd);
-                continue; 
-                }
-                long long expire = get_current_time() + 10000;
+        int client_fd = accept(
+            server_fd,
+            reinterpret_cast<sockaddr*>(&client_addr),
+            &client_addr_len
+        );
 
-                {
-                    std::lock_guard<std::mutex> c_lock(connection_mutex);
-                    connection[client_fd] = std::make_shared<HttpConnection>();
-                    connection[client_fd]->last_expire_time = expire;
-                }
-            
-                {
-                    std::lock_guard<std::mutex> t_lock(timer_mutex);
-                    timer_heap.push({client_fd, expire});
-                }
-            } 
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR) continue;
+
+            LOG_ERROR("accept 失败: %s", strerror(errno));
+            break;
         }
+
+        set_nonblocking(client_fd);
+
+        epoll_event client_ev{};
+        client_ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+        client_ev.data.fd = client_fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
+
+        long long expire = get_current_time() + 10000;
+        {
+            std::lock_guard<std::mutex> lock(connection_mutex);
+            connection[client_fd] = std::make_shared<HttpConnection>();
+            connection[client_fd]->last_expire_time = expire;
+        }
+        {
+            std::lock_guard<std::mutex> lock(timer_mutex);
+            timer_heap.push({client_fd, expire});
+        }
+    }
+}
            // ✅ 修复了极其致命的优先级括号问题
            // ✅ 修复了极其致命的优先级括号问题，并补齐了全部变量捕获
            else if (events[i].events & (EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
@@ -714,15 +851,38 @@ int main(){
                             }
                             
                             auto it = router.find(path);
-                            if (it != router.end() && conn_ptr->MapFile(it->second)) {
-                                status_line = "HTTP/1.1 200 OK\r\n";
+                           if (it != router.end()) {
+                                // 已经拼接好的绝对路径
+                                std::string absolute_filepath = STATIC_ROOT + it->second;
+                                
+                                // 调用我们刚写的严密安检函数
+                                if (conn_ptr->OpenFile(absolute_filepath)) {
+                                    status_line = "HTTP/1.1 200 OK\r\n";
+                                    std::string file_type = GetFileType(absolute_filepath);
+                                    
+                                    // 为什么要这样写：无论 file_size 是 10GB 还是 0 字节，逻辑都能完美闭环。
+                                    // 空文件直接返回 Content-Length: 0，客户端能正常收到 200 OK 但不显示内容。
+                                    std::string header = status_line + 
+                                                         "Content-Type: " + file_type + "\r\n" +
+                                                         "Content-Length: " + std::to_string(conn_ptr->file_size) + "\r\n" +
+                                                         "Connection: close\r\n\r\n";
+                                                         
+                                    conn_ptr->writeBuff.Append(header);
+                                } else {
+                                    goto handle_404; // 文件打不开、是个目录，统统 404 伺候
+                                }
                             } else {
+handle_404:
                                 status_line = "HTTP/1.1 404 Not Found\r\n";
                                 html_body = "<html><body><h1>404 Not Found</h1></body></html>";
-                                conn_ptr->file_size = 0;
+                                std::string header = status_line + 
+                                                     "Content-Type: text/html; charset=utf-8\r\n" +
+                                                     "Content-Length: " + std::to_string(html_body.length()) + "\r\n" +
+                                                     "Connection: close\r\n\r\n" + html_body;
+                                conn_ptr->writeBuff.Append(header);
+                                conn_ptr->file_size = 0; // 错误响应没有静态文件体
                             }
                         }
-
                         // 组装报文（当前阶段严格执行短连接，固定写入 Connection: close）
                         std::string header = status_line + 
                                              "Content-Type: text/html; charset=utf-8\r\n" +

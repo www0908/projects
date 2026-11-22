@@ -1,1 +1,436 @@
-<html><head><meta charset="utf-8"></head><body><h1>交通及纪！</h1></body></html>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="page-id" content="home" />
+  <title>WebServer — 高并发服务主控台</title>
+  <style>
+    :root {
+      --bg-page: #F5F5F7;
+      --bg-surface: rgba(255, 255, 255, 0.82);
+      --bg-surface-solid: #FFFFFF;
+      --text-primary: #1D1D1F;
+      --text-secondary: #6E6E73;
+      --text-muted: #86868B;
+      --apple-blue: #0071E3;
+      --apple-blue-hover: #0077ED;
+      --apple-blue-active: #0066CC;
+      --border-hairline: rgba(0, 0, 0, 0.08);
+      --green: #1D8348;
+      --green-bg: rgba(40, 205, 65, 0.12);
+      --ease-apple: cubic-bezier(0.22, 1, 0.36, 1);
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      min-height: 100%;
+      background-color: var(--bg-page);
+      background-image: radial-gradient(1000px 560px at 50% -10%, #FFFFFF 0%, rgba(255, 255, 255, 0) 70%);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* 顶部导航栏 */
+    .navbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(245, 245, 247, 0.72);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border-bottom: 1px solid var(--border-hairline);
+    }
+
+    .navbar-inner {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text-primary);
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #28CD41;
+    }
+
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .session-pill {
+      padding: 6px 12px;
+      border-radius: 980px;
+      background: rgba(0, 0, 0, 0.04);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .session-pill.online {
+      background: var(--green-bg);
+      color: var(--green);
+    }
+
+    .btn-nav {
+      padding: 7px 15px;
+      border-radius: 980px;
+      background: var(--apple-blue);
+      color: #FFFFFF;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.2s ease, transform 0.18s var(--ease-apple);
+    }
+
+    .btn-nav:hover {
+      background: var(--apple-blue-hover);
+    }
+
+    .btn-nav:active {
+      transform: scale(0.96);
+    }
+
+    /* 页面主体 */
+    .container {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 48px 24px 80px;
+    }
+
+    /* Hero 区域 */
+    .hero {
+      text-align: center;
+      max-width: 680px;
+      margin: 0 auto 48px;
+      animation: appleEnter 0.68s var(--ease-apple) both;
+    }
+
+    @keyframes appleEnter {
+      from {
+        opacity: 0;
+        transform: translate3d(0, 20px, 0) scale(0.99);
+      }
+      to {
+        opacity: 1;
+        transform: translate3d(0, 0, 0) scale(1);
+      }
+    }
+
+    .hero-eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 980px;
+      background: rgba(0, 113, 227, 0.08);
+      color: var(--apple-blue);
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+
+    .hero-title {
+      font-size: clamp(32px, 5vw, 48px);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.12;
+      color: var(--text-primary);
+      margin-bottom: 16px;
+    }
+
+    .hero-desc {
+      font-size: 17px;
+      line-height: 1.6;
+      color: var(--text-secondary);
+      margin-bottom: 28px;
+    }
+
+    .hero-actions {
+      display: inline-flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+    }
+
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px 24px;
+      border-radius: 980px;
+      background: var(--apple-blue);
+      color: #FFFFFF;
+      text-decoration: none;
+      font-size: 15px;
+      font-weight: 500;
+      transition: background 0.2s ease, transform 0.18s var(--ease-apple), box-shadow 0.2s ease;
+    }
+
+    .btn-primary:hover {
+      background: var(--apple-blue-hover);
+      box-shadow: 0 6px 18px rgba(0, 113, 227, 0.24);
+    }
+
+    .btn-primary:active {
+      background: var(--apple-blue-active);
+      transform: scale(0.97);
+    }
+
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px 24px;
+      border-radius: 980px;
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      background: rgba(255, 255, 255, 0.85);
+      color: var(--text-primary);
+      text-decoration: none;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s ease, transform 0.18s var(--ease-apple);
+    }
+
+    .btn-secondary:hover {
+      background: #FFFFFF;
+    }
+
+    .btn-secondary:active {
+      transform: scale(0.97);
+    }
+
+    /* Bento Grid 便当盒布局 */
+    .bento-grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .bento-card {
+      padding: 28px;
+      border-radius: 22px;
+      background: var(--bg-surface);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border: 1px solid var(--border-hairline);
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.04);
+      opacity: 0;
+      animation: appleEnter 0.65s var(--ease-apple) var(--d, 0.1s) forwards;
+      transition: transform 0.28s var(--ease-apple), box-shadow 0.28s ease;
+    }
+
+    .bento-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.06);
+    }
+
+    .span-6 { grid-column: span 6; }
+    .span-4 { grid-column: span 4; }
+    .span-8 { grid-column: span 8; }
+    .span-12 { grid-column: span 12; }
+
+    .bento-kicker {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--apple-blue);
+      margin-bottom: 8px;
+    }
+
+    .bento-metric {
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    .bento-title {
+      font-size: 19px;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    .bento-desc {
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--text-secondary);
+    }
+
+    /* 路由自检终端卡 */
+    .probe-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+
+    .probe-log {
+      padding: 16px 18px;
+      border-radius: 14px;
+      background: #F5F5F7;
+      border: 1px solid var(--border-hairline);
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.7;
+      color: var(--text-primary);
+      white-space: pre-wrap;
+      min-height: 86px;
+    }
+
+    @media (max-width: 820px) {
+      .span-6, .span-4, .span-8 {
+        grid-column: span 12;
+      }
+      .container {
+        padding: 32px 16px 60px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="navbar">
+    <div class="navbar-inner">
+      <a class="brand" href="/">
+        <span class="brand-dot"></span>
+        <span>WebServer</span>
+      </a>
+      <div class="nav-right">
+        <span class="session-pill" id="sessionPill">未登录</span>
+        <a class="btn-nav" href="/user" id="authNavBtn">登录 / 注册</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="hero-eyebrow">Linux C++14 · Epoll Reactor</div>
+      <h1 class="hero-title">极简、高并发的<br />HTTP 服务引擎</h1>
+      <p class="hero-desc">
+        基于 Epoll 边缘触发（ET）事件循环、固定线程池、有限状态机解析与内存映射零拷贝响应构建，兼顾低延迟与连接复用。
+      </p>
+      <div class="hero-actions">
+        <a class="btn-primary" href="/user">登录账户</a>
+        <a class="btn-secondary" href="/user?mode=register">创建新账户</a>
+      </div>
+    </section>
+
+    <section class="bento-grid">
+      <article class="bento-card span-4" style="--d:0.08s">
+        <div class="bento-kicker">I/O 多路复用</div>
+        <div class="bento-metric">Epoll ET</div>
+        <p class="bento-desc">采用 EPOLLET + EPOLLONESHOT 边缘触发与非阻塞套接字，单线程高效分发高并发就绪事件。</p>
+      </article>
+
+      <article class="bento-card span-4" style="--d:0.14s">
+        <div class="bento-kicker">并发调度</div>
+        <div class="bento-metric">4 Workers</div>
+        <p class="bento-desc">内置 ThreadPool 任务队列，将 HTTP 解析、数据库校验与响应写回解耦至工作线程执行。</p>
+      </article>
+
+      <article class="bento-card span-4" style="--d:0.20s">
+        <div class="bento-kicker">连接复用与超时</div>
+        <div class="bento-metric">Keep-Alive</div>
+        <p class="bento-desc">默认启用 HTTP/1.1 长连接复用，配合 10 秒小根堆定时器（TimerNode）自动清理空闲连接。</p>
+      </article>
+
+      <article class="bento-card span-6" style="--d:0.26s">
+        <div class="bento-kicker">协议解析与零拷贝传输</div>
+        <h2 class="bento-title">有限状态机 + Mmap / Writev</h2>
+        <p class="bento-desc">
+          HttpParser 按请求行、请求头、消息体四态循环解析粘包请求；静态 HTML 通过 mmap 内存映射与 writev 集中写直接发送。
+        </p>
+      </article>
+
+      <article class="bento-card span-6" style="--d:0.32s">
+        <div class="bento-kicker">安全认证与可观测性</div>
+        <h2 class="bento-title">MySQL 连接池 + 异步日志</h2>
+        <p class="bento-desc">
+          SqlConnPool 配合 RAII 句柄与 MYSQL_STMT 预处理防注入，密码经加盐 SHA-256 校验；AsyncLogger 双缓冲异步写入 server.log。
+        </p>
+      </article>
+
+      <article class="bento-card span-12" style="--d:0.38s">
+        <div class="probe-header">
+          <div>
+            <div class="bento-kicker">接口连通性</div>
+            <h2 class="bento-title" style="margin-bottom:0">路由自检控制台</h2>
+          </div>
+          <button type="button" class="btn-secondary" id="probeBtn">运行路由自检</button>
+        </div>
+        <div class="probe-log" id="probeLog">就绪 — 点击「运行路由自检」测试 GET /、GET /user 与 GET /error.html 的响应状态。</div>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      const sessionPill = document.getElementById('sessionPill');
+      const authNavBtn = document.getElementById('authNavBtn');
+      const probeBtn = document.getElementById('probeBtn');
+      const probeLog = document.getElementById('probeLog');
+
+      const currentUser = sessionStorage.getItem('epoll_user');
+      if (currentUser) {
+        sessionPill.textContent = '已登录：' + currentUser;
+        sessionPill.classList.add('online');
+        authNavBtn.textContent = '退出登录';
+        authNavBtn.addEventListener('click', (e) => {
+          e.preventDefault();
+          sessionStorage.removeItem('epoll_user');
+          window.location.href = '/user';
+        });
+      }
+
+      probeBtn.addEventListener('click', async () => {
+        const routes = ['/', '/user', '/error.html'];
+        probeLog.textContent = '正在检测路由连通性...\n';
+        for (const r of routes) {
+          const t0 = performance.now();
+          try {
+            const res = await fetch(r, { method: 'GET' });
+            const ms = (performance.now() - t0).toFixed(1);
+            probeLog.textContent += `GET ${r.padEnd(12, ' ')} -> HTTP ${res.status} (${ms} ms)\n`;
+          } catch (err) {
+            probeLog.textContent += `GET ${r} -> 失败 (${err.message})\n`;
+          }
+        }
+        probeLog.textContent += '检测完成。';
+      });
+    })();
+  </script>
+</body>
+</html>

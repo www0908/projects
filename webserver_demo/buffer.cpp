@@ -144,28 +144,29 @@ void Buffer::Append(const Buffer& buff) {
 
 // 彻底剥离系统调用错误处理：保留 errno 原样透传
 ssize_t Buffer::ReadFd(int fd, int* saveErrno) {
-    char extrabuff[65535];
-    struct iovec iov[2];
-    const size_t writeable = WritableBytes();
-    
-    iov[0].iov_base = BeginWrite();
-    iov[0].iov_len = writeable;
-    iov[1].iov_base = extrabuff;
-    iov[1].iov_len = sizeof(extrabuff);
-    
-    const ssize_t len = readv(fd, iov, 2);
-    
-    if (len < 0) {
-        *saveErrno = errno;
-    } else if (static_cast<size_t>(len) <= writeable) {
-        writePos_ += len;
-    } else {
-        writePos_ = buffer_.size();
-        Append(extrabuff, len - writeable);
-    }
-    return len;
-}
+    ssize_t total = 0;
 
+    while (true) {
+        EnsureWritable(4096);
+
+        ssize_t n = read(fd, BeginWrite(), WritableBytes());
+
+        if (n > 0) {
+            HasWritable(static_cast<size_t>(n));
+            total += n;
+            continue;
+        }
+
+        if (n == 0) return total == 0 ? 0 : total;
+        if (errno == EINTR) continue;
+
+        *saveErrno = errno;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return total;  // 已读到的数据仍然有效
+        }
+        return total > 0 ? total : -1;
+    }
+}
 ssize_t Buffer::WriteFd(int fd, int* saveErrno) {
     size_t readSize = ReadableBytes();
     ssize_t len = write(fd, Peek(), readSize); 
